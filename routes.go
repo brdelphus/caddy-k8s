@@ -2,6 +2,7 @@ package k8singress
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -16,10 +17,12 @@ type caddyRoute struct {
 }
 
 type caddyMatch struct {
-	Host     []string          `json:"host,omitempty"`
-	Path     []string          `json:"path,omitempty"`
-	RemoteIP *caddyRemoteIP    `json:"remote_ip,omitempty"`
-	Not      []caddyMatchInner `json:"not,omitempty"`
+	Host     []string            `json:"host,omitempty"`
+	Path     []string            `json:"path,omitempty"`
+	Method   []string            `json:"method,omitempty"`
+	Headers  map[string][]string `json:"header,omitempty"` // "header" is the Caddy matcher module key
+	RemoteIP *caddyRemoteIP      `json:"remote_ip,omitempty"`
+	Not      []caddyMatchInner   `json:"not,omitempty"`
 }
 
 type caddyMatchInner struct {
@@ -68,9 +71,13 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 			continue
 		}
 
-		// Prepend IP guard routes before path matching.
+		// Prepend IP guards then CORS preflight before path routes.
 		guardRoutes := buildIPGuardRoutes(ann)
-		allRoutes := append(guardRoutes, pathRoutes...)
+		var preflightRoutes []caddyRoute
+		if ann.cors != nil {
+			preflightRoutes = append(preflightRoutes, corsPreflightRoute(ann.cors))
+		}
+		allRoutes := append(guardRoutes, append(preflightRoutes, pathRoutes...)...)
 
 		var handle []interface{}
 		if len(allRoutes) == 1 && allRoutes[0].Match == nil && len(guardRoutes) == 0 {
@@ -171,15 +178,20 @@ func convertPath(path string, pt *networkingv1.PathType) []string {
 	return []string{path, path + "/*"}
 }
 
-// buildHandlers assembles the handler chain for a route in execution order:
-//  1. permanent/temporal redirect (short-circuits — no other handlers run)
-//  2. Basic auth
-//  3. Body size limit
-//  4. Rate limiting (reject early before WAF cycles are wasted)
-//  5. URI rewrite
-//  6. Security headers
-//  7. Coraza WAF
-//  8. reverse_proxy
+// buildHandlers assembles the handler chain for a route. For multi-origin CORS,
+// it wraps the core chain in a per-origin subroute to safely echo the matched
+// origin back. All other cases produce a flat chain.
+//
+// Execution order:
+//  1. permanent/temporal redirect  (short-circuits)
+//  2. CORS response headers        (prepended so error responses also carry them)
+//  3. Basic auth
+//  4. Body size limit
+//  5. Rate limiting                (early reject before WAF)
+//  6. URI rewrite
+//  7. Security headers
+//  8. Coraza WAF
+//  9. reverse_proxy
 func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) []interface{} {
 	// Redirect annotations replace the entire handler chain.
 	if ann.permanentRedirect != "" || ann.temporalRedirect != "" {
@@ -203,7 +215,43 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 		}
 	}
 
+	cors := ann.cors
+	if cors != nil && len(cors.origins) > 1 {
+		// Multiple specific origins: generate a subroute so we only echo back an
+		// origin that is in the allowed list. Uses {http.request.header.Origin}
+		// as the header value exclusively within the matched branch.
+		withCORS := buildCoreHandlers(upstream, sec, ann, true, true)
+		withoutCORS := buildCoreHandlers(upstream, sec, ann, false, false)
+		return []interface{}{map[string]interface{}{
+			"handler": "subroute",
+			"routes": []caddyRoute{
+				{
+					Match:    []caddyMatch{{Headers: map[string][]string{"Origin": cors.origins}}},
+					Handle:   withCORS,
+					Terminal: true,
+				},
+				{
+					Handle:   withoutCORS,
+					Terminal: true,
+				},
+			},
+		}}
+	}
+
+	return buildCoreHandlers(upstream, sec, ann, cors != nil, false)
+}
+
+// buildCoreHandlers builds the flat handler chain.
+// withCORS: prepend CORS response headers handler.
+// dynamic: use {http.request.header.Origin} as the Allow-Origin value instead
+//
+//	of the literal origin (safe only within an origin-matched subroute branch).
+func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations, withCORS bool, dynamic bool) []interface{} {
 	var handlers []interface{}
+
+	if withCORS && ann.cors != nil {
+		handlers = append(handlers, corsResponseHandler(ann.cors, dynamic))
+	}
 
 	if ann.basicAuth != nil {
 		handlers = append(handlers, basicAuthHandler(ann.basicAuth))
@@ -247,6 +295,74 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy))
 
 	return handlers
+}
+
+// corsPreflightRoute returns a terminal route that handles OPTIONS preflight
+// requests. For specific origins the route additionally matches the Origin
+// header so unrecognised origins fall through to a plain 204 (no CORS headers).
+func corsPreflightRoute(cors *corsConfig) caddyRoute {
+	var match caddyMatch
+	if cors.isWildcard() {
+		match = caddyMatch{Method: []string{"OPTIONS"}}
+	} else {
+		match = caddyMatch{
+			Method:  []string{"OPTIONS"},
+			Headers: map[string][]string{"Origin": cors.origins},
+		}
+	}
+	dynamic := len(cors.origins) > 1
+	return caddyRoute{
+		Match: []caddyMatch{match},
+		Handle: []interface{}{
+			corsResponseHandler(cors, dynamic),
+			map[string]interface{}{"handler": "static_response", "status_code": 204},
+		},
+		Terminal: true,
+	}
+}
+
+// corsResponseHandler wraps buildCORSResponseHeaders in a Caddy headers handler.
+func corsResponseHandler(cors *corsConfig, dynamic bool) map[string]interface{} {
+	return map[string]interface{}{
+		"handler":  "headers",
+		"response": map[string]interface{}{"set": buildCORSResponseHeaders(cors, dynamic)},
+	}
+}
+
+// buildCORSResponseHeaders assembles the full set of CORS response headers.
+// dynamic=true substitutes {http.request.header.Origin} for the Allow-Origin
+// value — only use this inside a route that has already validated the origin.
+func buildCORSResponseHeaders(cors *corsConfig, dynamic bool) map[string][]string {
+	var origin string
+	if dynamic {
+		origin = "{http.request.header.Origin}"
+	} else {
+		origin = cors.origins[0] // "*" or a single specific origin
+	}
+
+	h := map[string][]string{
+		"Access-Control-Allow-Origin": {origin},
+	}
+	// Vary: Origin is required for caches whenever the response differs by origin.
+	if origin != "*" {
+		h["Vary"] = []string{"Origin"}
+	}
+	if cors.allowMethods != "" {
+		h["Access-Control-Allow-Methods"] = []string{cors.allowMethods}
+	}
+	if cors.allowHeaders != "" {
+		h["Access-Control-Allow-Headers"] = []string{cors.allowHeaders}
+	}
+	if cors.exposeHeaders != "" {
+		h["Access-Control-Expose-Headers"] = []string{cors.exposeHeaders}
+	}
+	if cors.allowCreds {
+		h["Access-Control-Allow-Credentials"] = []string{"true"}
+	}
+	if cors.maxAge > 0 {
+		h["Access-Control-Max-Age"] = []string{strconv.Itoa(cors.maxAge)}
+	}
+	return h
 }
 
 // rateLimitHandler returns a caddy-ratelimit handler that limits requests per

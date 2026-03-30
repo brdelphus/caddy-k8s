@@ -129,6 +129,39 @@ const (
 	// Omit to inherit the global k8s_ingress security.waf setting.
 	annotationWAF = "caddy.ingress/waf"
 
+	// ── CORS ─────────────────────────────────────────────────────────────────────
+
+	// Enable Cross-Origin Resource Sharing for this Ingress.
+	// Value: "true" | "false"
+	annotationEnableCORS = "caddy.ingress/enable-cors"
+
+	// Allowed origins. "*" allows all origins (default).
+	// Comma-separated for multiple specific origins:
+	//   "https://app.example.com,https://admin.example.com"
+	// Note: cors-allow-credentials=true is incompatible with "*".
+	annotationCORSAllowOrigin = "caddy.ingress/cors-allow-origin"
+
+	// HTTP methods allowed in CORS requests.
+	// Default: "GET, PUT, POST, DELETE, PATCH, OPTIONS"
+	annotationCORSAllowMethods = "caddy.ingress/cors-allow-methods"
+
+	// Request headers allowed in CORS requests.
+	// Default: "DNT,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization"
+	annotationCORSAllowHeaders = "caddy.ingress/cors-allow-headers"
+
+	// Response headers the browser is allowed to access.
+	// Default: empty (not exposed)
+	annotationCORSExposeHeaders = "caddy.ingress/cors-expose-headers"
+
+	// Allow the browser to send credentials (cookies, TLS client certs).
+	// Incompatible with cors-allow-origin: "*".
+	// Value: "true" | "false" (default: "false")
+	annotationCORSAllowCredentials = "caddy.ingress/cors-allow-credentials"
+
+	// How long (seconds) the browser may cache a preflight response.
+	// Default: 1728000 (20 days — nginx-ingress default)
+	annotationCORSMaxAge = "caddy.ingress/cors-max-age"
+
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
 	// Name of a k8s Secret (same namespace) whose "auth" key holds htpasswd
@@ -139,6 +172,20 @@ const (
 	// WWW-Authenticate realm string. Default: "Restricted"
 	annotationBasicAuthRealm = "caddy.ingress/basic-auth-realm"
 )
+
+// corsConfig holds parsed CORS annotation values.
+type corsConfig struct {
+	origins       []string // ["*"] or one or more specific origins
+	allowMethods  string
+	allowHeaders  string
+	exposeHeaders string
+	allowCreds    bool
+	maxAge        int
+}
+
+func (c *corsConfig) isWildcard() bool {
+	return len(c.origins) == 1 && c.origins[0] == "*"
+}
 
 // ingressAnnotations holds parsed, resolved values from an Ingress's annotations.
 type ingressAnnotations struct {
@@ -154,7 +201,8 @@ type ingressAnnotations struct {
 	redirectCode      int // 0 = use type default (301/302)
 	rewriteTarget     string
 	serverAliases     []string
-	limitRPS          int // 0 = disabled
+	limitRPS          int         // 0 = disabled
+	cors              *corsConfig // nil = CORS disabled
 	// wafOverride overrides the global WAF setting for this Ingress.
 	// nil = inherit global; non-nil = use this value.
 	wafOverride *bool
@@ -331,6 +379,62 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 				zap.String("value", v),
 			)
 		}
+	}
+
+	// ── CORS ─────────────────────────────────────────────────────────────────────
+
+	if strings.EqualFold(a[annotationEnableCORS], "true") {
+		cfg := &corsConfig{
+			allowMethods: "GET, PUT, POST, DELETE, PATCH, OPTIONS",
+			allowHeaders: "DNT,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization",
+			maxAge:       1728000,
+		}
+
+		// Parse allowed origins (comma-separated).
+		if v := a[annotationCORSAllowOrigin]; v != "" {
+			for _, o := range strings.Split(v, ",") {
+				if o = strings.TrimSpace(o); o != "" {
+					cfg.origins = append(cfg.origins, o)
+				}
+			}
+		}
+		if len(cfg.origins) == 0 {
+			cfg.origins = []string{"*"}
+		}
+
+		// Credentials flag — incompatible with wildcard origin.
+		if strings.EqualFold(a[annotationCORSAllowCredentials], "true") {
+			if cfg.isWildcard() {
+				log.Warn("k8s_ingress: cors-allow-credentials=true is incompatible with cors-allow-origin=* — credentials ignored",
+					zap.String("ingress", ing.Namespace+"/"+ing.Name),
+				)
+			} else {
+				cfg.allowCreds = true
+			}
+		}
+
+		if v := a[annotationCORSAllowMethods]; v != "" {
+			cfg.allowMethods = strings.TrimSpace(v)
+		}
+		if v := a[annotationCORSAllowHeaders]; v != "" {
+			cfg.allowHeaders = strings.TrimSpace(v)
+		}
+		if v := a[annotationCORSExposeHeaders]; v != "" {
+			cfg.exposeHeaders = strings.TrimSpace(v)
+		}
+		if v := a[annotationCORSMaxAge]; v != "" {
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err == nil && n >= 0 {
+				cfg.maxAge = n
+			} else {
+				log.Warn("k8s_ingress: invalid cors-max-age — using default",
+					zap.String("ingress", ing.Namespace+"/"+ing.Name),
+					zap.String("value", v),
+				)
+			}
+		}
+
+		out.cors = cfg
 	}
 
 	// ── Proxy transport ──────────────────────────────────────────────────────────

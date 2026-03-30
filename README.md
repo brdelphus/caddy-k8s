@@ -156,6 +156,14 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 | `caddy.ingress/proxy-connect-timeout` | — | Seconds to establish upstream connection |
 | `caddy.ingress/proxy-next-upstream-tries` | — | Retry failed upstream requests N times before returning error |
 | `caddy.ingress/proxy-body-size` | — | Max request body size (`0` = unlimited, supports `k`/`m`/`g`) |
+| **CORS** | | |
+| `caddy.ingress/enable-cors` | `false` | Enable CORS for this Ingress |
+| `caddy.ingress/cors-allow-origin` | `*` | Allowed origin(s), comma-separated for multiple |
+| `caddy.ingress/cors-allow-methods` | `GET, PUT, POST, DELETE, PATCH, OPTIONS` | Allowed methods |
+| `caddy.ingress/cors-allow-headers` | `DNT,Keep-Alive,...,Authorization` | Allowed request headers |
+| `caddy.ingress/cors-expose-headers` | — | Response headers exposed to browser JS |
+| `caddy.ingress/cors-allow-credentials` | `false` | Allow credentials (incompatible with `*` origin) |
+| `caddy.ingress/cors-max-age` | `1728000` | Preflight cache duration in seconds |
 | **Security** | | |
 | `caddy.ingress/waf` | — | Per-route WAF override: `off`, `on`, or `detection` |
 | `caddy.ingress/whitelist-source-range` | — | Comma-separated CIDRs to allow; all others get 403 |
@@ -300,6 +308,58 @@ metadata:
 ```
 
 When omitted, the route inherits the `security.waf` setting from the `k8s_ingress` global config.
+
+### CORS
+
+Enable Cross-Origin Resource Sharing. A preflight `OPTIONS` route is injected automatically — browsers receive the correct preflight response without the request ever reaching the backend.
+
+**Wildcard (allow all origins):**
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/enable-cors: "true"
+```
+
+Adds `Access-Control-Allow-Origin: *` to all responses. Default methods and headers match nginx-ingress defaults.
+
+**Specific origin:**
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/enable-cors: "true"
+    caddy.ingress/cors-allow-origin: "https://app.example.com"
+    caddy.ingress/cors-allow-credentials: "true"
+```
+
+`Vary: Origin` is added automatically whenever the origin is not `*`.
+
+**Multiple specific origins:**
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/enable-cors: "true"
+    caddy.ingress/cors-allow-origin: "https://app.example.com,https://admin.example.com"
+```
+
+A subroute is generated internally so the `Access-Control-Allow-Origin` response value only echoes an origin that appears in the allowed list — unrecognised origins receive a plain response with no CORS headers.
+
+**Custom methods and headers:**
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/enable-cors: "true"
+    caddy.ingress/cors-allow-origin: "https://frontend.example.com"
+    caddy.ingress/cors-allow-methods: "GET, POST, OPTIONS"
+    caddy.ingress/cors-allow-headers: "Authorization,Content-Type,X-Request-ID"
+    caddy.ingress/cors-expose-headers: "X-RateLimit-Remaining"
+    caddy.ingress/cors-max-age: "86400"
+```
+
+> **Note:** `cors-allow-credentials: true` is silently ignored when `cors-allow-origin: *` — browsers reject that combination and the module logs a warning.
 
 ### Temporary redirect
 
