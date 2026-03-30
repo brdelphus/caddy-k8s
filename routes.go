@@ -167,12 +167,26 @@ func convertPath(path string, pt *networkingv1.PathType) []string {
 }
 
 // buildHandlers assembles the handler chain for a route in execution order:
-//  1. Basic auth
-//  2. Body size limit
-//  3. Security headers
-//  4. Coraza WAF
-//  5. reverse_proxy
+//  1. permanent-redirect (short-circuits — no other handlers run)
+//  2. Basic auth
+//  3. Body size limit
+//  4. Security headers
+//  5. Coraza WAF
+//  6. reverse_proxy
 func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) []interface{} {
+	// permanent-redirect replaces the entire handler chain with a 301.
+	if ann.permanentRedirect != "" {
+		return []interface{}{
+			map[string]interface{}{
+				"handler":     "static_response",
+				"status_code": 301,
+				"headers": map[string][]string{
+					"Location": {ann.permanentRedirect},
+				},
+			},
+		}
+	}
+
 	var handlers []interface{}
 
 	if ann.basicAuth != nil {
@@ -264,9 +278,22 @@ func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig) 
 		},
 	}
 
-	// Transport — only set if at least one timeout is configured.
+	// Transport — set when TLS, HTTP version, or timeouts are configured.
 	transport := map[string]interface{}{"protocol": "http"}
 	hasTransport := false
+
+	if proxy.backendTLS {
+		tls := map[string]interface{}{}
+		if proxy.backendTLSInsecure {
+			tls["insecure_skip_verify"] = true
+		}
+		transport["tls"] = tls
+		hasTransport = true
+	}
+	if proxy.httpVersion != "" {
+		transport["versions"] = []string{proxy.httpVersion}
+		hasTransport = true
+	}
 	if proxy.readTimeout != "" {
 		transport["response_header_timeout"] = proxy.readTimeout
 		hasTransport = true

@@ -50,6 +50,31 @@ const (
 	// Value: integer bytes or with suffix k/m/g, e.g. "2048m", "4g", "512k"
 	annotationProxyBodySize = "caddy.ingress/proxy-body-size"
 
+	// ── Backend protocol ─────────────────────────────────────────────────────────
+
+	// Backend connection protocol. "HTTPS" enables TLS on the upstream transport.
+	// Value: "HTTP" | "HTTPS" (default: "HTTP")
+	annotationBackendProtocol = "caddy.ingress/backend-protocol"
+
+	// Skip TLS verification for the upstream. Use with backend-protocol: HTTPS
+	// when the backend uses a self-signed certificate (e.g. Mailu front).
+	// Value: "true" | "false" (default: "false")
+	annotationBackendTLSInsecure = "caddy.ingress/backend-tls-insecure-skip-verify"
+
+	// ── Redirects ────────────────────────────────────────────────────────────────
+
+	// Redirect all paths in this Ingress to a fixed URL with 301.
+	// Replaces the reverse_proxy handler entirely — use for .well-known redirects.
+	// Value: full URL, e.g. "https://example.com/remote.php/dav"
+	annotationPermanentRedirect = "caddy.ingress/permanent-redirect"
+
+	// ── Proxy transport ──────────────────────────────────────────────────────────
+
+	// Force a specific HTTP version for upstream requests.
+	// "1.1" is required for streaming and WebSocket backends (e.g. AzuraCast).
+	// Value: "1.1" | "2" (default: unset — Caddy negotiates)
+	annotationProxyHTTPVersion = "caddy.ingress/proxy-http-version"
+
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
 	// Name of a k8s Secret (same namespace) whose "auth" key holds htpasswd
@@ -63,11 +88,12 @@ const (
 
 // ingressAnnotations holds parsed, resolved values from an Ingress's annotations.
 type ingressAnnotations struct {
-	whitelist   []string
-	blocklist   []string
-	sslRedirect bool
-	proxy       proxyConfig
-	basicAuth   *basicAuthConfig
+	whitelist        []string
+	blocklist        []string
+	sslRedirect      bool
+	permanentRedirect string
+	proxy            proxyConfig
+	basicAuth        *basicAuthConfig
 }
 
 // proxyConfig holds upstream connection/timeout/body settings.
@@ -78,6 +104,12 @@ type proxyConfig struct {
 	connectTimeout string
 	// Maximum request body size in bytes. 0 = no limit.
 	maxBodySize int64
+	// backendTLS enables TLS on the upstream transport (backend-protocol: HTTPS).
+	backendTLS bool
+	// backendTLSInsecure skips upstream certificate verification.
+	backendTLSInsecure bool
+	// httpVersion forces a specific HTTP version to upstream, e.g. "1.1".
+	httpVersion string
 }
 
 // basicAuthConfig holds parsed htpasswd accounts for Caddy's http_basic provider.
@@ -138,6 +170,27 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 		} else {
 			out.proxy.maxBodySize = size
 		}
+	}
+
+	// ── Backend protocol ─────────────────────────────────────────────────────────
+
+	if strings.EqualFold(a[annotationBackendProtocol], "https") {
+		out.proxy.backendTLS = true
+	}
+	if strings.EqualFold(a[annotationBackendTLSInsecure], "true") {
+		out.proxy.backendTLSInsecure = true
+	}
+
+	// ── Redirects ────────────────────────────────────────────────────────────────
+
+	if v := a[annotationPermanentRedirect]; v != "" {
+		out.permanentRedirect = strings.TrimSpace(v)
+	}
+
+	// ── Proxy transport ──────────────────────────────────────────────────────────
+
+	if v := a[annotationProxyHTTPVersion]; v != "" {
+		out.proxy.httpVersion = strings.TrimSpace(v)
 	}
 
 	// ── Basic auth ───────────────────────────────────────────────────────────────

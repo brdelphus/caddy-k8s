@@ -14,6 +14,11 @@ Built to pair with [caddy-custom](https://github.com/brdelphus/caddy-custom), a 
   - Security headers (HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, removes `Server`)
   - `X-Real-IP` + `X-Forwarded-*` injection to upstream — required by nginx-based backends (Mailu, etc.)
   - Optional [Coraza WAF](https://github.com/corazawaf/coraza-caddy) per route (Detection or blocking mode)
+- Annotation-driven per-Ingress behaviour:
+  - HTTPS backends with optional TLS verification skip (e.g. Mailu self-signed)
+  - Permanent 301 redirects replacing the reverse proxy (e.g. `.well-known` → `/remote.php/dav`)
+  - Forced HTTP/1.1 to upstream for streaming and WebSocket backends (e.g. AzuraCast)
+  - Proxy timeouts, body size limits, IP whitelist/blocklist, Basic Auth
 - Supports `pathType: Prefix`, `Exact`, and `ImplementationSpecific`
 - Caddyfile global block configuration
 - Falls back to `~/.kube/config` for local development
@@ -130,7 +135,23 @@ spec:
 
 All annotations use the `caddy.ingress/` prefix and are set per Ingress resource.
 
-All annotations use the `caddy.ingress/` prefix.
+| Annotation | Default | Description |
+|---|---|---|
+| `caddy.ingress/ssl-redirect` | `false` | Redirect HTTP → HTTPS with 301 |
+| `caddy.ingress/backend-protocol` | `HTTP` | `HTTPS` to enable TLS on the upstream transport |
+| `caddy.ingress/backend-tls-insecure-skip-verify` | `false` | Skip upstream TLS verification (use with `backend-protocol: HTTPS`) |
+| `caddy.ingress/permanent-redirect` | — | Redirect all paths in this Ingress to a fixed URL with 301 |
+| `caddy.ingress/proxy-http-version` | — | Force HTTP version to upstream: `1.1` or `2` |
+| `caddy.ingress/proxy-read-timeout` | — | Seconds to wait for upstream response headers |
+| `caddy.ingress/proxy-send-timeout` | — | Seconds to transmit the request to upstream |
+| `caddy.ingress/proxy-connect-timeout` | — | Seconds to establish upstream connection |
+| `caddy.ingress/proxy-body-size` | — | Max request body size (`0` = unlimited, supports `k`/`m`/`g`) |
+| `caddy.ingress/whitelist-source-range` | — | Comma-separated CIDRs to allow; all others get 403 |
+| `caddy.ingress/blocklist-source-range` | — | Comma-separated CIDRs to deny; all others pass |
+| `caddy.ingress/basic-auth-secret` | — | Secret name (same namespace) with `auth` htpasswd key |
+| `caddy.ingress/basic-auth-realm` | `Restricted` | WWW-Authenticate realm string |
+
+---
 
 ### IP whitelist
 
@@ -181,6 +202,75 @@ metadata:
   annotations:
     caddy.ingress/proxy-body-size: "2048m"   # supports k / m / g suffixes, "0" = unlimited
 ```
+
+### Backend protocol (HTTPS upstream)
+
+When the backend speaks HTTPS (e.g. Mailu's front container), enable TLS on the upstream transport:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/backend-protocol: HTTPS
+```
+
+If the backend uses a self-signed certificate, add:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/backend-protocol: HTTPS
+    caddy.ingress/backend-tls-insecure-skip-verify: "true"
+```
+
+This is equivalent to nginx's `nginx.ingress.kubernetes.io/backend-protocol: HTTPS`.
+
+### Permanent redirect
+
+Redirect all paths in an Ingress to a fixed URL with 301. The reverse proxy is replaced entirely — no upstream connection is made. Useful for `.well-known` redirects required by CalDAV/CardDAV clients:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nextcloud-wellknown
+  namespace: nextcloud
+  annotations:
+    caddy.ingress/permanent-redirect: "https://dav.example.com/remote.php/dav"
+spec:
+  ingressClassName: caddy-custom
+  rules:
+    - host: dav.example.com
+      http:
+        paths:
+          - path: /.well-known/carddav
+            pathType: Exact
+            backend:
+              service:
+                name: nextcloud
+                port:
+                  number: 8080
+          - path: /.well-known/caldav
+            pathType: Exact
+            backend:
+              service:
+                name: nextcloud
+                port:
+                  number: 8080
+```
+
+Every path listed in the Ingress will 301 to the annotation value — the backend field is ignored.
+
+### Proxy HTTP version
+
+Force a specific HTTP version for upstream connections. Use `1.1` for streaming endpoints and WebSocket backends that require connection-level persistence (e.g. AzuraCast's Icecast/HLS streams):
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/proxy-http-version: "1.1"
+```
+
+Without this, Caddy may negotiate HTTP/2 to the upstream, which does not support the streaming upgrade mechanism.
 
 ### Basic auth
 
