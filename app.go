@@ -253,9 +253,20 @@ func (a *App) handleAdd(obj interface{}) {
 		}
 	}
 
+	// Plain HTTP ingresses go to the HTTP server, all others to HTTPS.
+	targetServer := a.serverName
+	if ann.plainHTTP {
+		if a.httpServerName == "" {
+			a.logger.Error("k8s_ingress: plain-http=true but no HTTP server found — route skipped",
+				zap.String("ingress", key))
+			return
+		}
+		targetServer = a.httpServerName
+	}
+
 	// Upsert each route.
 	for _, r := range routes {
-		if err := adm.upsertRoute(context.Background(), a.serverName, r); err != nil {
+		if err := adm.upsertRoute(context.Background(), targetServer, r); err != nil {
 			a.logger.Error("k8s_ingress: upsert route", zap.String("id", r.ID), zap.Error(err))
 		}
 	}

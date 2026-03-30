@@ -275,7 +275,9 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 		})
 	}
 
-	if sec.SecurityHeaders {
+	// Skip security headers on plain HTTP routes — HSTS on HTTP is incorrect and
+	// ignored by browsers; the other headers are irrelevant for internal services.
+	if sec.SecurityHeaders && !ann.plainHTTP {
 		handlers = append(handlers, securityHeadersHandler())
 	}
 
@@ -292,7 +294,7 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 		handlers = append(handlers, wafHandler(wafMode))
 	}
 
-	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy))
+	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy, ann.plainHTTP))
 
 	return handlers
 }
@@ -439,7 +441,7 @@ func wafHandler(mode string) map[string]interface{} {
 
 // reverseProxyHandler returns the Caddy reverse_proxy handler JSON, applying
 // any per-Ingress proxy timeouts and real-IP header injection.
-func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig) map[string]interface{} {
+func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig, plainHTTP bool) map[string]interface{} {
 	h := map[string]interface{}{
 		"handler": "reverse_proxy",
 		"upstreams": []map[string]interface{}{
@@ -482,11 +484,15 @@ func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig) 
 	// Build upstream request headers — merge all sources into one set map.
 	reqHeaders := map[string][]string{}
 	if injectRealIP {
+		proto, port := "https", "443"
+		if plainHTTP {
+			proto, port = "http", "80"
+		}
 		reqHeaders["X-Real-IP"] = []string{"{client_ip}"}
 		reqHeaders["X-Forwarded-For"] = []string{"{client_ip}"}
-		reqHeaders["X-Forwarded-Proto"] = []string{"https"}
+		reqHeaders["X-Forwarded-Proto"] = []string{proto}
 		reqHeaders["X-Forwarded-Host"] = []string{"{http.request.host}"}
-		reqHeaders["X-Forwarded-Port"] = []string{"443"}
+		reqHeaders["X-Forwarded-Port"] = []string{port}
 	}
 	if proxy.upstreamVhost != "" {
 		reqHeaders["Host"] = []string{proxy.upstreamVhost}

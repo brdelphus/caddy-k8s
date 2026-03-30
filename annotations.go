@@ -162,6 +162,14 @@ const (
 	// Default: 1728000 (20 days — nginx-ingress default)
 	annotationCORSMaxAge = "caddy.ingress/cors-max-age"
 
+	// ── Plain HTTP ───────────────────────────────────────────────────────────────
+
+	// Serve this Ingress over plain HTTP (port 80) instead of HTTPS.
+	// Use for internal services on private networks that do not need TLS,
+	// or for hostnames that are not publicly resolvable (so ACME cannot be used).
+	// Value: "true" | "false" (default: "false")
+	annotationPlainHTTP = "caddy.ingress/plain-http"
+
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
 	// Name of a k8s Secret (same namespace) whose "auth" key holds htpasswd
@@ -203,6 +211,8 @@ type ingressAnnotations struct {
 	serverAliases     []string
 	limitRPS          int         // 0 = disabled
 	cors              *corsConfig // nil = CORS disabled
+	// plainHTTP routes this Ingress to the HTTP server (port 80) instead of HTTPS.
+	plainHTTP bool
 	// wafOverride overrides the global WAF setting for this Ingress.
 	// nil = inherit global; non-nil = use this value.
 	wafOverride *bool
@@ -464,6 +474,12 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 				zap.String("value", v),
 			)
 		}
+	}
+
+	// ── Plain HTTP ───────────────────────────────────────────────────────────────
+
+	if strings.EqualFold(a[annotationPlainHTTP], "true") {
+		out.plainHTTP = true
 	}
 
 	// ── Basic auth ───────────────────────────────────────────────────────────────
