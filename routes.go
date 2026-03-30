@@ -83,8 +83,13 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 		}
 
 		var match []caddyMatch
-		if rule.Host != "" {
-			match = []caddyMatch{{Host: []string{rule.Host}}}
+		if rule.Host != "" || len(ann.serverAliases) > 0 {
+			hosts := make([]string, 0, 1+len(ann.serverAliases))
+			if rule.Host != "" {
+				hosts = append(hosts, rule.Host)
+			}
+			hosts = append(hosts, ann.serverAliases...)
+			match = []caddyMatch{{Host: hosts}}
 		}
 
 		routes = append(routes, caddyRoute{
@@ -167,21 +172,32 @@ func convertPath(path string, pt *networkingv1.PathType) []string {
 }
 
 // buildHandlers assembles the handler chain for a route in execution order:
-//  1. permanent-redirect (short-circuits — no other handlers run)
+//  1. permanent/temporal redirect (short-circuits — no other handlers run)
 //  2. Basic auth
 //  3. Body size limit
-//  4. Security headers
-//  5. Coraza WAF
-//  6. reverse_proxy
+//  4. Rate limiting (reject early before WAF cycles are wasted)
+//  5. URI rewrite
+//  6. Security headers
+//  7. Coraza WAF
+//  8. reverse_proxy
 func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) []interface{} {
-	// permanent-redirect replaces the entire handler chain with a 301.
-	if ann.permanentRedirect != "" {
+	// Redirect annotations replace the entire handler chain.
+	if ann.permanentRedirect != "" || ann.temporalRedirect != "" {
+		url := ann.permanentRedirect
+		code := 301
+		if ann.temporalRedirect != "" {
+			url = ann.temporalRedirect
+			code = 302
+		}
+		if ann.redirectCode > 0 {
+			code = ann.redirectCode
+		}
 		return []interface{}{
 			map[string]interface{}{
 				"handler":     "static_response",
-				"status_code": 301,
+				"status_code": code,
 				"headers": map[string][]string{
-					"Location": {ann.permanentRedirect},
+					"Location": {url},
 				},
 			},
 		}
@@ -197,6 +213,17 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 		handlers = append(handlers, map[string]interface{}{
 			"handler":  "request_body",
 			"max_size": ann.proxy.maxBodySize,
+		})
+	}
+
+	if ann.limitRPS > 0 {
+		handlers = append(handlers, rateLimitHandler(ann.namespace, ann.name, ann.limitRPS))
+	}
+
+	if ann.rewriteTarget != "" {
+		handlers = append(handlers, map[string]interface{}{
+			"handler": "rewrite",
+			"uri":     ann.rewriteTarget,
 		})
 	}
 
@@ -220,6 +247,23 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy))
 
 	return handlers
+}
+
+// rateLimitHandler returns a caddy-ratelimit handler that limits requests per
+// second from each client IP. Zone name is derived from the Ingress namespace
+// and name to avoid collisions between routes.
+func rateLimitHandler(namespace, name string, rps int) map[string]interface{} {
+	zoneName := fmt.Sprintf("caddy-k8s-%s-%s", namespace, name)
+	return map[string]interface{}{
+		"handler": "rate_limit",
+		"rate_limits": map[string]interface{}{
+			zoneName: map[string]interface{}{
+				"key":        "{client_ip}",
+				"window":     "1s",
+				"max_events": rps,
+			},
+		},
+	}
 }
 
 // basicAuthHandler returns the Caddy http_basic authentication handler JSON.
@@ -319,17 +363,32 @@ func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig) 
 		h["transport"] = transport
 	}
 
+	// Build upstream request headers — merge all sources into one set map.
+	reqHeaders := map[string][]string{}
 	if injectRealIP {
+		reqHeaders["X-Real-IP"] = []string{"{client_ip}"}
+		reqHeaders["X-Forwarded-For"] = []string{"{client_ip}"}
+		reqHeaders["X-Forwarded-Proto"] = []string{"https"}
+		reqHeaders["X-Forwarded-Host"] = []string{"{http.request.host}"}
+		reqHeaders["X-Forwarded-Port"] = []string{"443"}
+	}
+	if proxy.upstreamVhost != "" {
+		reqHeaders["Host"] = []string{proxy.upstreamVhost}
+	}
+	if proxy.xForwardedPrefix != "" {
+		reqHeaders["X-Forwarded-Prefix"] = []string{proxy.xForwardedPrefix}
+	}
+	if len(reqHeaders) > 0 {
 		h["headers"] = map[string]interface{}{
 			"request": map[string]interface{}{
-				"set": map[string][]string{
-					"X-Real-IP":         {"{client_ip}"},
-					"X-Forwarded-For":   {"{client_ip}"},
-					"X-Forwarded-Proto": {"https"},
-					"X-Forwarded-Host":  {"{http.request.host}"},
-					"X-Forwarded-Port":  {"443"},
-				},
+				"set": reqHeaders,
 			},
+		}
+	}
+
+	if proxy.retries > 0 {
+		h["load_balancing"] = map[string]interface{}{
+			"retries": proxy.retries,
 		}
 	}
 

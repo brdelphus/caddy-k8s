@@ -137,18 +137,30 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 
 | Annotation | Default | Description |
 |---|---|---|
+| **Redirects** | | |
 | `caddy.ingress/ssl-redirect` | `false` | Redirect HTTP → HTTPS with 301 |
+| `caddy.ingress/permanent-redirect` | — | 301-redirect all paths to a fixed URL (replaces reverse_proxy) |
+| `caddy.ingress/temporal-redirect` | — | 302-redirect all paths to a fixed URL (replaces reverse_proxy) |
+| `caddy.ingress/redirect-code` | 301/302 | Override HTTP status for either redirect type (e.g. `307`, `308`) |
+| **Routing** | | |
+| `caddy.ingress/rewrite-target` | — | Rewrite the request URI before proxying (e.g. `/`, `/api/v2`) |
+| `caddy.ingress/server-alias` | — | Additional hostnames this Ingress responds to (comma-separated) |
+| **Backend** | | |
 | `caddy.ingress/backend-protocol` | `HTTP` | `HTTPS` to enable TLS on the upstream transport |
-| `caddy.ingress/backend-tls-insecure-skip-verify` | `false` | Skip upstream TLS verification (use with `backend-protocol: HTTPS`) |
-| `caddy.ingress/permanent-redirect` | — | Redirect all paths in this Ingress to a fixed URL with 301 |
+| `caddy.ingress/backend-tls-insecure-skip-verify` | `false` | Skip upstream TLS verification (self-signed backend certs) |
+| `caddy.ingress/upstream-vhost` | — | Override the `Host` header sent to upstream |
+| `caddy.ingress/x-forwarded-prefix` | — | Set `X-Forwarded-Prefix` header on upstream requests |
 | `caddy.ingress/proxy-http-version` | — | Force HTTP version to upstream: `1.1` or `2` |
-| `caddy.ingress/waf` | — | Per-route WAF override: `off`, `on`, or `detection` (overrides global setting) |
 | `caddy.ingress/proxy-read-timeout` | — | Seconds to wait for upstream response headers |
 | `caddy.ingress/proxy-send-timeout` | — | Seconds to transmit the request to upstream |
 | `caddy.ingress/proxy-connect-timeout` | — | Seconds to establish upstream connection |
+| `caddy.ingress/proxy-next-upstream-tries` | — | Retry failed upstream requests N times before returning error |
 | `caddy.ingress/proxy-body-size` | — | Max request body size (`0` = unlimited, supports `k`/`m`/`g`) |
+| **Security** | | |
+| `caddy.ingress/waf` | — | Per-route WAF override: `off`, `on`, or `detection` |
 | `caddy.ingress/whitelist-source-range` | — | Comma-separated CIDRs to allow; all others get 403 |
 | `caddy.ingress/blocklist-source-range` | — | Comma-separated CIDRs to deny; all others pass |
+| `caddy.ingress/limit-rps` | — | Max requests/second per client IP (uses caddy-ratelimit) |
 | `caddy.ingress/basic-auth-secret` | — | Secret name (same namespace) with `auth` htpasswd key |
 | `caddy.ingress/basic-auth-realm` | `Restricted` | WWW-Authenticate realm string |
 
@@ -288,6 +300,89 @@ metadata:
 ```
 
 When omitted, the route inherits the `security.waf` setting from the `k8s_ingress` global config.
+
+### Temporary redirect
+
+Like `permanent-redirect` but returns 302 instead of 301:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/temporal-redirect: "https://maintenance.example.com"
+```
+
+Override the status code for either redirect type:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/permanent-redirect: "https://new.example.com/path"
+    caddy.ingress/redirect-code: "308"   # Permanent Redirect (method-preserving)
+```
+
+### URI rewrite
+
+Rewrite the request path before proxying. The full URI is replaced with the annotation value — no capture group substitution:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/rewrite-target: "/"
+```
+
+This is most useful when the Ingress path has a prefix that the backend does not expect. For example, path `/api` in the Ingress spec with `rewrite-target: /` makes Caddy strip `/api` and forward as `/`.
+
+### Server aliases
+
+Serve additional hostnames from the same Ingress rules:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/server-alias: "alias1.example.com,alias2.example.com"
+```
+
+### Upstream host override
+
+Override the `Host` header sent to the backend service (the client's original `Host` is preserved in `X-Forwarded-Host`):
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/upstream-vhost: "internal.backend.local"
+```
+
+### X-Forwarded-Prefix
+
+Set the `X-Forwarded-Prefix` header on upstream requests. Required by some backends (Grafana, Nextcloud) when they are hosted under a sub-path:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/x-forwarded-prefix: "/grafana"
+```
+
+### Rate limiting
+
+Limit requests per second per client IP using the `caddy-ratelimit` module (must be in the Caddy build):
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/limit-rps: "50"   # 50 req/s per IP, sliding 1-second window
+```
+
+Rate limiting is applied before WAF to avoid wasting inspection cycles on rejected requests.
+
+### Upstream retries
+
+Retry failed upstream requests before returning an error to the client:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/proxy-next-upstream-tries: "3"
+```
 
 ### Basic auth
 

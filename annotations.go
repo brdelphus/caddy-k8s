@@ -68,6 +68,51 @@ const (
 	// Value: full URL, e.g. "https://example.com/remote.php/dav"
 	annotationPermanentRedirect = "caddy.ingress/permanent-redirect"
 
+	// Redirect all paths in this Ingress to a fixed URL with 302 (temporary).
+	// Value: full URL, e.g. "https://example.com/new-location"
+	annotationTemporalRedirect = "caddy.ingress/temporal-redirect"
+
+	// Override the HTTP status code used by permanent-redirect or temporal-redirect.
+	// Value: 3xx integer, e.g. "307" or "308"
+	annotationRedirectCode = "caddy.ingress/redirect-code"
+
+	// ── Rewrite ──────────────────────────────────────────────────────────────────
+
+	// Rewrite the request URI before proxying to the upstream.
+	// Replaces the entire URI path — capture group substitution is not supported.
+	// Value: URI path, e.g. "/", "/api/v1"
+	annotationRewriteTarget = "caddy.ingress/rewrite-target"
+
+	// ── Upstream headers ─────────────────────────────────────────────────────────
+
+	// Override the Host header sent to the upstream service.
+	// Value: hostname, e.g. "internal.example.com"
+	annotationUpstreamVhost = "caddy.ingress/upstream-vhost"
+
+	// Set the X-Forwarded-Prefix header sent to the upstream service.
+	// Value: path prefix, e.g. "/myapp"
+	annotationXForwardedPrefix = "caddy.ingress/x-forwarded-prefix"
+
+	// ── Virtual hosting ───────────────────────────────────────────────────────────
+
+	// Additional hostnames this Ingress should respond to (comma-separated).
+	// These hosts are added to the same route as the Ingress rules.
+	// Value: "alias1.example.com,alias2.example.com"
+	annotationServerAlias = "caddy.ingress/server-alias"
+
+	// ── Rate limiting ─────────────────────────────────────────────────────────────
+
+	// Maximum requests per second per client IP. Uses caddy-ratelimit (1-second
+	// sliding window, keyed by client IP).
+	// Value: integer, e.g. "100"
+	annotationLimitRPS = "caddy.ingress/limit-rps"
+
+	// ── Upstream resilience ──────────────────────────────────────────────────────
+
+	// Number of times to retry failed upstream requests before returning an error.
+	// Value: integer, e.g. "3"
+	annotationProxyNextUpstreamTries = "caddy.ingress/proxy-next-upstream-tries"
+
 	// ── Proxy transport ──────────────────────────────────────────────────────────
 
 	// Force a specific HTTP version for upstream requests.
@@ -97,10 +142,19 @@ const (
 
 // ingressAnnotations holds parsed, resolved values from an Ingress's annotations.
 type ingressAnnotations struct {
+	// namespace/name stored here so handlers can derive stable zone names.
+	namespace string
+	name      string
+
 	whitelist         []string
 	blocklist         []string
 	sslRedirect       bool
 	permanentRedirect string
+	temporalRedirect  string
+	redirectCode      int // 0 = use type default (301/302)
+	rewriteTarget     string
+	serverAliases     []string
+	limitRPS          int // 0 = disabled
 	// wafOverride overrides the global WAF setting for this Ingress.
 	// nil = inherit global; non-nil = use this value.
 	wafOverride *bool
@@ -125,6 +179,13 @@ type proxyConfig struct {
 	backendTLSInsecure bool
 	// httpVersion forces a specific HTTP version to upstream, e.g. "1.1".
 	httpVersion string
+	// upstreamVhost overrides the Host header sent to the upstream.
+	upstreamVhost string
+	// xForwardedPrefix sets X-Forwarded-Prefix on upstream requests.
+	xForwardedPrefix string
+	// retries is the number of times to retry failed upstream requests.
+	// 0 = Caddy default (no retries).
+	retries int
 }
 
 // basicAuthConfig holds parsed htpasswd accounts for Caddy's http_basic provider.
@@ -143,7 +204,10 @@ type basicAuthAccount struct {
 // Ingress never blocks others.
 func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *networkingv1.Ingress, log *zap.Logger) ingressAnnotations {
 	a := ing.Annotations
-	var out ingressAnnotations
+	out := ingressAnnotations{
+		namespace: ing.Namespace,
+		name:      ing.Name,
+	}
 
 	// ── Access control ───────────────────────────────────────────────────────────
 
@@ -200,6 +264,73 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 
 	if v := a[annotationPermanentRedirect]; v != "" {
 		out.permanentRedirect = strings.TrimSpace(v)
+	}
+	if v := a[annotationTemporalRedirect]; v != "" {
+		out.temporalRedirect = strings.TrimSpace(v)
+	}
+	if v := a[annotationRedirectCode]; v != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil && n >= 300 && n < 400 {
+			out.redirectCode = n
+		} else {
+			log.Warn("k8s_ingress: invalid redirect-code — must be 3xx integer",
+				zap.String("ingress", ing.Namespace+"/"+ing.Name),
+				zap.String("value", v),
+			)
+		}
+	}
+
+	// ── Rewrite ──────────────────────────────────────────────────────────────────
+
+	if v := a[annotationRewriteTarget]; v != "" {
+		out.rewriteTarget = strings.TrimSpace(v)
+	}
+
+	// ── Upstream headers ─────────────────────────────────────────────────────────
+
+	if v := a[annotationUpstreamVhost]; v != "" {
+		out.proxy.upstreamVhost = strings.TrimSpace(v)
+	}
+	if v := a[annotationXForwardedPrefix]; v != "" {
+		out.proxy.xForwardedPrefix = strings.TrimSpace(v)
+	}
+
+	// ── Virtual hosting ───────────────────────────────────────────────────────────
+
+	if v := a[annotationServerAlias]; v != "" {
+		for _, alias := range strings.Split(v, ",") {
+			if alias = strings.TrimSpace(alias); alias != "" {
+				out.serverAliases = append(out.serverAliases, alias)
+			}
+		}
+	}
+
+	// ── Rate limiting ─────────────────────────────────────────────────────────────
+
+	if v := a[annotationLimitRPS]; v != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil && n > 0 {
+			out.limitRPS = n
+		} else {
+			log.Warn("k8s_ingress: invalid limit-rps — must be positive integer",
+				zap.String("ingress", ing.Namespace+"/"+ing.Name),
+				zap.String("value", v),
+			)
+		}
+	}
+
+	// ── Upstream resilience ──────────────────────────────────────────────────────
+
+	if v := a[annotationProxyNextUpstreamTries]; v != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil && n > 0 {
+			out.proxy.retries = n
+		} else {
+			log.Warn("k8s_ingress: invalid proxy-next-upstream-tries — must be positive integer",
+				zap.String("ingress", ing.Namespace+"/"+ing.Name),
+				zap.String("value", v),
+			)
+		}
 	}
 
 	// ── Proxy transport ──────────────────────────────────────────────────────────
