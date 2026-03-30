@@ -1,6 +1,8 @@
 package k8singress
 
 import (
+	"fmt"
+
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
@@ -23,6 +25,11 @@ func init() {
 //	            waf_mode         Detection
 //	            security_headers on
 //	            inject_real_ip   on
+//	        }
+//	        redis {
+//	            address  redis.redis.svc.cluster.local:6379
+//	            password secret   # optional
+//	            db       0        # optional
 //	        }
 //	    }
 //	}
@@ -65,10 +72,48 @@ func (a *App) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 
+			case "redis":
+				if err := a.parseRedisBlock(d); err != nil {
+					return err
+				}
+
 			default:
 				return d.Errf("unknown k8s_ingress option: %s", d.Val())
 			}
 		}
+	}
+	return nil
+}
+
+func (a *App) parseRedisBlock(d *caddyfile.Dispenser) error {
+	a.Redis = new(RedisConfig)
+	for d.NextBlock(1) {
+		switch d.Val() {
+		case "address":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			a.Redis.Address = d.Val()
+		case "password":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			a.Redis.Password = d.Val()
+		case "db":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var db int
+			if _, err := fmt.Sscanf(d.Val(), "%d", &db); err != nil {
+				return d.Errf("redis db must be an integer: %s", d.Val())
+			}
+			a.Redis.DB = db
+		default:
+			return d.Errf("unknown redis option: %s", d.Val())
+		}
+	}
+	if a.Redis.Address == "" {
+		return d.Err("redis block requires an address")
 	}
 	return nil
 }

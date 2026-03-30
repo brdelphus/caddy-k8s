@@ -47,12 +47,19 @@ type App struct {
 	// Ingress-generated route.
 	Security SecurityConfig `json:"security,omitempty"`
 
-	logger     *zap.Logger
-	client     kubernetes.Interface
-	stopCh     chan struct{}
-	mu         sync.Mutex
-	// routes maps "namespace/name" to the list of Caddy route IDs owned by
-	// that Ingress, used for cleanup on delete.
+	// Redis enables persistent storage of the Ingress → route ID mapping.
+	// When set, route ownership survives Caddy restarts: stale routes from
+	// Ingresses deleted while Caddy was down are cleaned up on next startup.
+	// If omitted, an in-memory store is used (routes re-sync from the
+	// Kubernetes API on every restart, but orphaned routes may accumulate).
+	Redis *RedisConfig `json:"redis,omitempty"`
+
+	logger         *zap.Logger
+	client         kubernetes.Interface
+	stopCh         chan struct{}
+	mu             sync.Mutex
+	store          routeStore
+	// routeIDs is an in-process cache of store contents for fast lookups.
 	routeIDs       map[string][]string
 	serverName     string // resolved at Start() — HTTPS (:443)
 	httpServerName string // resolved at Start() — HTTP (:80), used for ssl-redirect
@@ -81,7 +88,7 @@ func (*App) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets defaults.
+// Provision sets defaults and initialises the route store.
 func (a *App) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
 	if a.IngressClass == "" {
@@ -95,6 +102,26 @@ func (a *App) Provision(ctx caddy.Context) error {
 	}
 	a.routeIDs = make(map[string][]string)
 	a.stopCh = make(chan struct{})
+
+	if a.Redis != nil {
+		rs, err := newRedisStore(a.Redis, a.IngressClass)
+		if err != nil {
+			// Redis is optional — warn and fall back to in-memory.
+			a.logger.Warn("k8s_ingress: redis unavailable, falling back to in-memory store",
+				zap.String("addr", a.Redis.Address),
+				zap.Error(err),
+			)
+			a.store = newMemoryStore()
+		} else {
+			a.logger.Info("k8s_ingress: redis store enabled",
+				zap.String("addr", a.Redis.Address),
+			)
+			a.store = rs
+		}
+	} else {
+		a.store = newMemoryStore()
+	}
+
 	return nil
 }
 
@@ -134,6 +161,19 @@ func (a *App) Start() error {
 	}
 	a.httpServerName = httpName
 
+	// Restore persisted route ownership from the store so we can clean up
+	// routes belonging to Ingresses that were deleted while Caddy was down.
+	if stored, err := a.store.loadAll(context.Background()); err != nil {
+		a.logger.Warn("k8s_ingress: could not restore route IDs from store", zap.Error(err))
+	} else if len(stored) > 0 {
+		a.mu.Lock()
+		for k, v := range stored {
+			a.routeIDs[k] = v
+		}
+		a.mu.Unlock()
+		a.logger.Info("k8s_ingress: restored route IDs from store", zap.Int("ingresses", len(stored)))
+	}
+
 	a.logger.Info("k8s_ingress: watching ingresses",
 		zap.String("class", a.IngressClass),
 		zap.String("https_server", a.serverName),
@@ -157,9 +197,12 @@ func (a *App) Start() error {
 	return nil
 }
 
-// Stop shuts down the informer.
+// Stop shuts down the informer and closes the store connection.
 func (a *App) Stop() error {
 	close(a.stopCh)
+	if err := a.store.close(); err != nil {
+		a.logger.Warn("k8s_ingress: store close", zap.Error(err))
+	}
 	return nil
 }
 
@@ -221,6 +264,10 @@ func (a *App) handleAdd(obj interface{}) {
 	a.routeIDs[key] = newIDs
 	a.mu.Unlock()
 
+	if err := a.store.save(context.Background(), key, newIDs); err != nil {
+		a.logger.Warn("k8s_ingress: store save", zap.String("ingress", key), zap.Error(err))
+	}
+
 	a.logger.Info("k8s_ingress: synced ingress", zap.String("ingress", key), zap.Int("routes", len(routes)))
 }
 
@@ -242,6 +289,11 @@ func (a *App) handleDelete(obj interface{}) {
 			a.logger.Warn("k8s_ingress: delete route", zap.String("id", id), zap.Error(err))
 		}
 	}
+
+	if err := a.store.remove(context.Background(), key); err != nil {
+		a.logger.Warn("k8s_ingress: store remove", zap.String("ingress", key), zap.Error(err))
+	}
+
 	a.logger.Info("k8s_ingress: removed ingress", zap.String("ingress", key))
 }
 
