@@ -130,6 +130,8 @@ spec:
 
 All annotations use the `caddy.ingress/` prefix and are set per Ingress resource.
 
+All annotations use the `caddy.ingress/` prefix.
+
 ### IP whitelist
 
 Allow only specific CIDRs — all other IPs receive `403 Forbidden`:
@@ -151,6 +153,34 @@ metadata:
 ```
 
 Both can be combined. Whitelist is evaluated first, then blocklist.
+
+### SSL redirect
+
+Redirect HTTP traffic to HTTPS with a 301:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/ssl-redirect: "true"
+```
+
+### Proxy timeouts
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/proxy-read-timeout: "300"      # seconds — waiting for upstream response headers
+    caddy.ingress/proxy-send-timeout: "300"      # seconds — transmitting request to upstream
+    caddy.ingress/proxy-connect-timeout: "60"    # seconds — establishing upstream connection
+```
+
+### Request body size
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/proxy-body-size: "2048m"   # supports k / m / g suffixes, "0" = unlimited
+```
 
 ### Basic auth
 

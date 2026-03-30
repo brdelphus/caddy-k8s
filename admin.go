@@ -70,9 +70,10 @@ func (c *adminClient) routeExists(ctx context.Context, id string) (bool, error) 
 	return resp.StatusCode == http.StatusOK, nil
 }
 
-// resolveServerName returns the name of the Caddy HTTP server that listens
-// on :443. If hint is non-empty it is returned directly (allows override).
-func resolveServerName(ctx context.Context, c *adminClient, hint string) (string, error) {
+// resolveServerName returns the name of the Caddy HTTP server that listens on
+// the given port (e.g. ":443" or ":80"). If hint is non-empty it is returned
+// directly, allowing explicit override via config.
+func resolveServerName(ctx context.Context, c *adminClient, hint, port string) (string, error) {
 	if hint != "" {
 		return hint, nil
 	}
@@ -101,13 +102,13 @@ func resolveServerName(ctx context.Context, c *adminClient, hint string) (string
 
 	for name, srv := range servers {
 		for _, addr := range srv.Listen {
-			if strings.HasSuffix(addr, ":443") || addr == ":443" {
+			if strings.HasSuffix(addr, port) {
 				return name, nil
 			}
 		}
 	}
 
-	return "", fmt.Errorf("no Caddy server listening on :443 found — set server_name explicitly")
+	return "", fmt.Errorf("no Caddy server listening on %s found — set server_name explicitly", port)
 }
 
 func (c *adminClient) do(ctx context.Context, method, path string, body []byte) error {

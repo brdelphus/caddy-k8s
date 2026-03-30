@@ -32,9 +32,13 @@ type App struct {
 	// kubernetes.io/ingress.class annotation) to watch. Default: caddy-custom.
 	IngressClass string `json:"ingress_class,omitempty"`
 
-	// ServerName is the name of the Caddy HTTP server block to inject routes
-	// into. If empty, the module discovers the server listening on :443.
+	// ServerName is the name of the Caddy HTTP server block to inject HTTPS
+	// routes into. If empty, the module discovers the server listening on :443.
 	ServerName string `json:"server_name,omitempty"`
+
+	// HTTPServerName is the name of the Caddy HTTP server block used for
+	// ssl-redirect routes (port 80). Auto-discovered if empty.
+	HTTPServerName string `json:"http_server_name,omitempty"`
 
 	// AdminAPI is the Caddy admin API address. Default: localhost:2019.
 	AdminAPI string `json:"admin_api,omitempty"`
@@ -49,8 +53,9 @@ type App struct {
 	mu         sync.Mutex
 	// routes maps "namespace/name" to the list of Caddy route IDs owned by
 	// that Ingress, used for cleanup on delete.
-	routeIDs   map[string][]string
-	serverName string // resolved at Start()
+	routeIDs       map[string][]string
+	serverName     string // resolved at Start() — HTTPS (:443)
+	httpServerName string // resolved at Start() — HTTP (:80), used for ssl-redirect
 }
 
 // SecurityConfig controls which security middleware is injected per route.
@@ -116,14 +121,23 @@ func (a *App) Start() error {
 
 	// Resolve which Caddy server to inject routes into.
 	adm := newAdminClient(a.AdminAPI)
-	name, err := resolveServerName(context.Background(), adm, a.ServerName)
+	name, err := resolveServerName(context.Background(), adm, a.ServerName, ":443")
 	if err != nil {
-		return fmt.Errorf("k8s_ingress: resolve server name: %w", err)
+		return fmt.Errorf("k8s_ingress: resolve https server name: %w", err)
 	}
 	a.serverName = name
+
+	httpName, err := resolveServerName(context.Background(), adm, a.HTTPServerName, ":80")
+	if err != nil {
+		// Not fatal — ssl-redirect simply won't work without an HTTP server.
+		a.logger.Warn("k8s_ingress: HTTP server not found, ssl-redirect will be skipped", zap.Error(err))
+	}
+	a.httpServerName = httpName
+
 	a.logger.Info("k8s_ingress: watching ingresses",
 		zap.String("class", a.IngressClass),
-		zap.String("server", a.serverName),
+		zap.String("https_server", a.serverName),
+		zap.String("http_server", a.httpServerName),
 	)
 
 	factory := informers.NewSharedInformerFactory(client, 30*time.Second)
@@ -165,6 +179,16 @@ func (a *App) handleAdd(obj interface{}) {
 	adm := newAdminClient(a.AdminAPI)
 	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
 	routes := convertIngress(ing, a.Security, ann)
+
+	// ssl-redirect: also inject HTTP→HTTPS redirect routes on the HTTP server.
+	if ann.sslRedirect && a.httpServerName != "" {
+		for _, r := range httpRedirectRoutes(ing) {
+			if err := adm.upsertRoute(context.Background(), a.httpServerName, r); err != nil {
+				a.logger.Warn("k8s_ingress: upsert ssl-redirect route",
+					zap.String("id", r.ID), zap.Error(err))
+			}
+		}
+	}
 
 	a.mu.Lock()
 	oldIDs := a.routeIDs[key]

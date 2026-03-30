@@ -8,7 +8,6 @@ import (
 )
 
 // caddyRoute is the JSON representation of a single Caddy HTTP route.
-// Fields must match Caddy's admin API JSON schema exactly.
 type caddyRoute struct {
 	ID       string        `json:"@id,omitempty"`
 	Match    []caddyMatch  `json:"match,omitempty"`
@@ -32,8 +31,6 @@ type caddyRemoteIP struct {
 }
 
 // convertIngress converts a Kubernetes Ingress into one or more Caddy routes.
-// Each host in the Ingress rules becomes a separate route with a subroute
-// handler for per-path dispatch.
 func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAnnotations) []caddyRoute {
 	var routes []caddyRoute
 
@@ -42,7 +39,6 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 			continue
 		}
 
-		// Build per-path subroutes.
 		var pathRoutes []caddyRoute
 		for i, p := range rule.HTTP.Paths {
 			if p.Backend.Service == nil {
@@ -52,12 +48,8 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 			port := p.Backend.Service.Port.Number
 			upstream := fmt.Sprintf("%s.%s.svc.cluster.local:%d", svc, ing.Namespace, port)
 
-			pathMatch := caddyMatch{
-				Path: convertPath(p.Path, p.PathType),
-			}
-
+			pathMatch := caddyMatch{Path: convertPath(p.Path, p.PathType)}
 			handlers := buildHandlers(upstream, sec, ann)
-
 			pathRouteID := routeID(ing.Namespace, ing.Name, rule.Host, i)
 
 			var match []caddyMatch
@@ -76,8 +68,7 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 			continue
 		}
 
-		// Prepend IP guard routes (whitelist/blocklist) at the subroute level
-		// so they run before any path matching.
+		// Prepend IP guard routes before path matching.
 		guardRoutes := buildIPGuardRoutes(ann)
 		allRoutes := append(guardRoutes, pathRoutes...)
 
@@ -96,10 +87,8 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 			match = []caddyMatch{{Host: []string{rule.Host}}}
 		}
 
-		id := routeID(ing.Namespace, ing.Name, rule.Host, -1)
-
 		routes = append(routes, caddyRoute{
-			ID:       id,
+			ID:       routeID(ing.Namespace, ing.Name, rule.Host, -1),
 			Match:    match,
 			Handle:   handle,
 			Terminal: true,
@@ -109,11 +98,34 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 	return routes
 }
 
-// buildIPGuardRoutes returns deny routes that run before path matching:
-//   - whitelist: deny (403) anything NOT in the allowed CIDRs
-//   - blocklist: deny (403) anything IN the blocked CIDRs
-//
-// Both can coexist; whitelist is evaluated first.
+// httpRedirectRoutes returns 301 HTTP→HTTPS redirect routes for each host in
+// the Ingress. These are injected into the HTTP (port 80) server.
+func httpRedirectRoutes(ing *networkingv1.Ingress) []caddyRoute {
+	var routes []caddyRoute
+	for _, rule := range ing.Spec.Rules {
+		if rule.Host == "" {
+			continue
+		}
+		routes = append(routes, caddyRoute{
+			ID:    routeID(ing.Namespace, ing.Name, rule.Host, -1) + "-http-redirect",
+			Match: []caddyMatch{{Host: []string{rule.Host}}},
+			Handle: []interface{}{
+				map[string]interface{}{
+					"handler":     "static_response",
+					"status_code": 301,
+					"headers": map[string][]string{
+						"Location": {"https://{http.request.host}{http.request.uri}"},
+					},
+				},
+			},
+			Terminal: true,
+		})
+	}
+	return routes
+}
+
+// buildIPGuardRoutes returns deny-first routes for whitelist and blocklist.
+// Whitelist is evaluated before blocklist.
 func buildIPGuardRoutes(ann ingressAnnotations) []caddyRoute {
 	var guards []caddyRoute
 
@@ -124,27 +136,15 @@ func buildIPGuardRoutes(ann ingressAnnotations) []caddyRoute {
 					RemoteIP: &caddyRemoteIP{Ranges: ann.whitelist},
 				}},
 			}},
-			Handle: []interface{}{
-				map[string]interface{}{
-					"handler":     "static_response",
-					"status_code": 403,
-				},
-			},
+			Handle:   []interface{}{map[string]interface{}{"handler": "static_response", "status_code": 403}},
 			Terminal: true,
 		})
 	}
 
 	if len(ann.blocklist) > 0 {
 		guards = append(guards, caddyRoute{
-			Match: []caddyMatch{{
-				RemoteIP: &caddyRemoteIP{Ranges: ann.blocklist},
-			}},
-			Handle: []interface{}{
-				map[string]interface{}{
-					"handler":     "static_response",
-					"status_code": 403,
-				},
-			},
+			Match:    []caddyMatch{{RemoteIP: &caddyRemoteIP{Ranges: ann.blocklist}}},
+			Handle:   []interface{}{map[string]interface{}{"handler": "static_response", "status_code": 403}},
 			Terminal: true,
 		})
 	}
@@ -152,35 +152,38 @@ func buildIPGuardRoutes(ann ingressAnnotations) []caddyRoute {
 	return guards
 }
 
-// convertPath translates a Kubernetes Ingress path + pathType into Caddy path
-// matcher strings.
+// convertPath translates a Kubernetes path + pathType into Caddy path matchers.
 func convertPath(path string, pt *networkingv1.PathType) []string {
 	if path == "" || path == "/" {
-		return nil // match all paths — no path constraint needed
+		return nil
 	}
-
 	if pt != nil && *pt == networkingv1.PathTypeExact {
 		return []string{path}
 	}
-
-	// Prefix (and ImplementationSpecific treated as Prefix):
-	// "/api" should match "/api" and "/api/anything" but NOT "/apifoo".
 	if strings.HasSuffix(path, "/") {
 		return []string{path + "*"}
 	}
 	return []string{path, path + "/*"}
 }
 
-// buildHandlers assembles the ordered handler chain for a route:
-//  1. Basic auth (if configured via annotation)
-//  2. Security headers (if enabled in global config)
-//  3. Coraza WAF (if enabled in global config)
-//  4. reverse_proxy to upstream
+// buildHandlers assembles the handler chain for a route in execution order:
+//  1. Basic auth
+//  2. Body size limit
+//  3. Security headers
+//  4. Coraza WAF
+//  5. reverse_proxy
 func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) []interface{} {
 	var handlers []interface{}
 
 	if ann.basicAuth != nil {
 		handlers = append(handlers, basicAuthHandler(ann.basicAuth))
+	}
+
+	if ann.proxy.maxBodySize > 0 {
+		handlers = append(handlers, map[string]interface{}{
+			"handler":  "request_body",
+			"max_size": ann.proxy.maxBodySize,
+		})
 	}
 
 	if sec.SecurityHeaders {
@@ -191,14 +194,12 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 		handlers = append(handlers, wafHandler(sec.WAFMode))
 	}
 
-	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP))
+	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy))
 
 	return handlers
 }
 
-// basicAuthHandler returns the Caddy authentication handler JSON for HTTP Basic Auth.
-// Requires bcrypt-hashed passwords (generated with: htpasswd -nbB user pass).
-// The password hash stored in the k8s Secret must use $2y$ or $2a$ prefix.
+// basicAuthHandler returns the Caddy http_basic authentication handler JSON.
 func basicAuthHandler(cfg *basicAuthConfig) map[string]interface{} {
 	accounts := make([]map[string]interface{}, 0, len(cfg.accounts))
 	for _, a := range cfg.accounts {
@@ -218,8 +219,8 @@ func basicAuthHandler(cfg *basicAuthConfig) map[string]interface{} {
 	}
 }
 
-// securityHeadersHandler returns the Caddy headers handler JSON that sets
-// common security response headers.
+// securityHeadersHandler returns the Caddy headers handler for common security
+// response headers.
 func securityHeadersHandler() map[string]interface{} {
 	return map[string]interface{}{
 		"handler": "headers",
@@ -236,7 +237,6 @@ func securityHeadersHandler() map[string]interface{} {
 }
 
 // wafHandler returns the Coraza WAF handler JSON.
-// Requires coraza-caddy compiled into the Caddy binary.
 func wafHandler(mode string) map[string]interface{} {
 	ruleEngine := "DetectionOnly"
 	if strings.EqualFold(mode, "On") {
@@ -254,13 +254,33 @@ func wafHandler(mode string) map[string]interface{} {
 	}
 }
 
-// reverseProxyHandler returns the Caddy reverse_proxy handler JSON.
-func reverseProxyHandler(upstream string, injectRealIP bool) map[string]interface{} {
+// reverseProxyHandler returns the Caddy reverse_proxy handler JSON, applying
+// any per-Ingress proxy timeouts and real-IP header injection.
+func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig) map[string]interface{} {
 	h := map[string]interface{}{
 		"handler": "reverse_proxy",
 		"upstreams": []map[string]interface{}{
 			{"dial": upstream},
 		},
+	}
+
+	// Transport — only set if at least one timeout is configured.
+	transport := map[string]interface{}{"protocol": "http"}
+	hasTransport := false
+	if proxy.readTimeout != "" {
+		transport["response_header_timeout"] = proxy.readTimeout
+		hasTransport = true
+	}
+	if proxy.sendTimeout != "" {
+		transport["write_timeout"] = proxy.sendTimeout
+		hasTransport = true
+	}
+	if proxy.connectTimeout != "" {
+		transport["dial_timeout"] = proxy.connectTimeout
+		hasTransport = true
+	}
+	if hasTransport {
+		h["transport"] = transport
 	}
 
 	if injectRealIP {
@@ -279,8 +299,8 @@ func reverseProxyHandler(upstream string, injectRealIP bool) map[string]interfac
 	return h
 }
 
-// routeID generates a stable, unique Caddy route @id for a given Ingress
-// host + path index. Use pathIdx = -1 for the parent (host-level) route.
+// routeID generates a stable Caddy route @id for a given Ingress host + path
+// index. pathIdx = -1 is used for the parent host-level route.
 func routeID(namespace, name, host string, pathIdx int) string {
 	h := strings.ReplaceAll(host, ".", "-")
 	h = strings.ReplaceAll(h, "*", "wildcard")
