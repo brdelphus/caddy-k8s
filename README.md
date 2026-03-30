@@ -142,6 +142,7 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 | `caddy.ingress/backend-tls-insecure-skip-verify` | `false` | Skip upstream TLS verification (use with `backend-protocol: HTTPS`) |
 | `caddy.ingress/permanent-redirect` | — | Redirect all paths in this Ingress to a fixed URL with 301 |
 | `caddy.ingress/proxy-http-version` | — | Force HTTP version to upstream: `1.1` or `2` |
+| `caddy.ingress/waf` | — | Per-route WAF override: `off`, `on`, or `detection` (overrides global setting) |
 | `caddy.ingress/proxy-read-timeout` | — | Seconds to wait for upstream response headers |
 | `caddy.ingress/proxy-send-timeout` | — | Seconds to transmit the request to upstream |
 | `caddy.ingress/proxy-connect-timeout` | — | Seconds to establish upstream connection |
@@ -271,6 +272,22 @@ metadata:
 ```
 
 Without this, Caddy may negotiate HTTP/2 to the upstream, which does not support the streaming upgrade mechanism.
+
+> **Note:** Caddy proxies WebSocket connections automatically — no special annotation is needed. The `proxy-http-version: "1.1"` annotation is only required for raw streaming protocols like Icecast.
+
+### WAF per-route override
+
+Override the global WAF setting for a single Ingress. Useful when WAF is enabled globally but a specific backend is incompatible with WAF inspection (e.g. AzuraCast's streaming endpoints):
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/waf: "off"        # disable WAF for this route
+    # caddy.ingress/waf: "on"       # enable WAF in blocking mode
+    # caddy.ingress/waf: "detection" # enable WAF in detection-only (log) mode
+```
+
+When omitted, the route inherits the `security.waf` setting from the `k8s_ingress` global config.
 
 ### Basic auth
 

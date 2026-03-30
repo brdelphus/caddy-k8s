@@ -204,8 +204,17 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 		handlers = append(handlers, securityHeadersHandler())
 	}
 
-	if sec.WAF {
-		handlers = append(handlers, wafHandler(sec.WAFMode))
+	// WAF: per-route annotation overrides the global SecurityConfig setting.
+	wafEnabled := sec.WAF
+	wafMode := sec.WAFMode
+	if ann.wafOverride != nil {
+		wafEnabled = *ann.wafOverride
+		if ann.wafModeOverride != "" {
+			wafMode = ann.wafModeOverride
+		}
+	}
+	if wafEnabled {
+		handlers = append(handlers, wafHandler(wafMode))
 	}
 
 	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy))
@@ -318,6 +327,7 @@ func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig) 
 					"X-Forwarded-For":   {"{client_ip}"},
 					"X-Forwarded-Proto": {"https"},
 					"X-Forwarded-Host":  {"{http.request.host}"},
+					"X-Forwarded-Port":  {"443"},
 				},
 			},
 		}

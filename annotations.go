@@ -75,6 +75,15 @@ const (
 	// Value: "1.1" | "2" (default: unset — Caddy negotiates)
 	annotationProxyHTTPVersion = "caddy.ingress/proxy-http-version"
 
+	// ── WAF override ─────────────────────────────────────────────────────────────
+
+	// Override the global WAF setting for this Ingress.
+	// "off"       = disable WAF for this route even if enabled globally
+	// "on"        = enable WAF in blocking mode
+	// "detection" = enable WAF in detection-only (log) mode
+	// Omit to inherit the global k8s_ingress security.waf setting.
+	annotationWAF = "caddy.ingress/waf"
+
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
 	// Name of a k8s Secret (same namespace) whose "auth" key holds htpasswd
@@ -88,12 +97,18 @@ const (
 
 // ingressAnnotations holds parsed, resolved values from an Ingress's annotations.
 type ingressAnnotations struct {
-	whitelist        []string
-	blocklist        []string
-	sslRedirect      bool
+	whitelist         []string
+	blocklist         []string
+	sslRedirect       bool
 	permanentRedirect string
-	proxy            proxyConfig
-	basicAuth        *basicAuthConfig
+	// wafOverride overrides the global WAF setting for this Ingress.
+	// nil = inherit global; non-nil = use this value.
+	wafOverride *bool
+	// wafModeOverride overrides the global WAF mode when wafOverride is non-nil.
+	// Empty = use global WAFMode.
+	wafModeOverride string
+	proxy             proxyConfig
+	basicAuth         *basicAuthConfig
 }
 
 // proxyConfig holds upstream connection/timeout/body settings.
@@ -191,6 +206,29 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 
 	if v := a[annotationProxyHTTPVersion]; v != "" {
 		out.proxy.httpVersion = strings.TrimSpace(v)
+	}
+
+	// ── WAF override ─────────────────────────────────────────────────────────────
+
+	if v := strings.ToLower(strings.TrimSpace(a[annotationWAF])); v != "" {
+		switch v {
+		case "off":
+			f := false
+			out.wafOverride = &f
+		case "on":
+			t := true
+			out.wafOverride = &t
+			out.wafModeOverride = "On"
+		case "detection":
+			t := true
+			out.wafOverride = &t
+			out.wafModeOverride = "DetectionOnly"
+		default:
+			log.Warn("k8s_ingress: unknown waf annotation value — ignored",
+				zap.String("ingress", ing.Namespace+"/"+ing.Name),
+				zap.String("value", v),
+			)
+		}
 	}
 
 	// ── Basic auth ───────────────────────────────────────────────────────────────
