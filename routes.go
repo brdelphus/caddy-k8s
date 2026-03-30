@@ -17,14 +17,24 @@ type caddyRoute struct {
 }
 
 type caddyMatch struct {
-	Host []string `json:"host,omitempty"`
-	Path []string `json:"path,omitempty"`
+	Host     []string          `json:"host,omitempty"`
+	Path     []string          `json:"path,omitempty"`
+	RemoteIP *caddyRemoteIP    `json:"remote_ip,omitempty"`
+	Not      []caddyMatchInner `json:"not,omitempty"`
+}
+
+type caddyMatchInner struct {
+	RemoteIP *caddyRemoteIP `json:"remote_ip,omitempty"`
+}
+
+type caddyRemoteIP struct {
+	Ranges []string `json:"ranges"`
 }
 
 // convertIngress converts a Kubernetes Ingress into one or more Caddy routes.
 // Each host in the Ingress rules becomes a separate route with a subroute
 // handler for per-path dispatch.
-func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig) []caddyRoute {
+func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAnnotations) []caddyRoute {
 	var routes []caddyRoute
 
 	for _, rule := range ing.Spec.Rules {
@@ -46,9 +56,8 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig) []caddyRoute 
 				Path: convertPath(p.Path, p.PathType),
 			}
 
-			handlers := buildHandlers(upstream, sec)
+			handlers := buildHandlers(upstream, sec, ann)
 
-			// Assign a stable ID so we can upsert/delete individual paths.
 			pathRouteID := routeID(ing.Namespace, ing.Name, rule.Host, i)
 
 			var match []caddyMatch
@@ -67,17 +76,19 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig) []caddyRoute 
 			continue
 		}
 
-		// If there's only one path and no host, emit a flat route.
-		// Otherwise wrap in subroute under the host matcher.
+		// Prepend IP guard routes (whitelist/blocklist) at the subroute level
+		// so they run before any path matching.
+		guardRoutes := buildIPGuardRoutes(ann)
+		allRoutes := append(guardRoutes, pathRoutes...)
+
 		var handle []interface{}
-		if len(pathRoutes) == 1 && pathRoutes[0].Match == nil {
-			handle = pathRoutes[0].Handle
+		if len(allRoutes) == 1 && allRoutes[0].Match == nil && len(guardRoutes) == 0 {
+			handle = allRoutes[0].Handle
 		} else {
-			subroute := map[string]interface{}{
+			handle = []interface{}{map[string]interface{}{
 				"handler": "subroute",
-				"routes":  pathRoutes,
-			}
-			handle = []interface{}{subroute}
+				"routes":  allRoutes,
+			}}
 		}
 
 		var match []caddyMatch
@@ -85,8 +96,6 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig) []caddyRoute 
 			match = []caddyMatch{{Host: []string{rule.Host}}}
 		}
 
-		// Use the first path route's ID as the parent route ID so that
-		// the admin client can upsert/delete it via @id.
 		id := routeID(ing.Namespace, ing.Name, rule.Host, -1)
 
 		routes = append(routes, caddyRoute{
@@ -98,6 +107,49 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig) []caddyRoute 
 	}
 
 	return routes
+}
+
+// buildIPGuardRoutes returns deny routes that run before path matching:
+//   - whitelist: deny (403) anything NOT in the allowed CIDRs
+//   - blocklist: deny (403) anything IN the blocked CIDRs
+//
+// Both can coexist; whitelist is evaluated first.
+func buildIPGuardRoutes(ann ingressAnnotations) []caddyRoute {
+	var guards []caddyRoute
+
+	if len(ann.whitelist) > 0 {
+		guards = append(guards, caddyRoute{
+			Match: []caddyMatch{{
+				Not: []caddyMatchInner{{
+					RemoteIP: &caddyRemoteIP{Ranges: ann.whitelist},
+				}},
+			}},
+			Handle: []interface{}{
+				map[string]interface{}{
+					"handler":     "static_response",
+					"status_code": 403,
+				},
+			},
+			Terminal: true,
+		})
+	}
+
+	if len(ann.blocklist) > 0 {
+		guards = append(guards, caddyRoute{
+			Match: []caddyMatch{{
+				RemoteIP: &caddyRemoteIP{Ranges: ann.blocklist},
+			}},
+			Handle: []interface{}{
+				map[string]interface{}{
+					"handler":     "static_response",
+					"status_code": 403,
+				},
+			},
+			Terminal: true,
+		})
+	}
+
+	return guards
 }
 
 // convertPath translates a Kubernetes Ingress path + pathType into Caddy path
@@ -114,19 +166,22 @@ func convertPath(path string, pt *networkingv1.PathType) []string {
 	// Prefix (and ImplementationSpecific treated as Prefix):
 	// "/api" should match "/api" and "/api/anything" but NOT "/apifoo".
 	if strings.HasSuffix(path, "/") {
-		// "/api/" → match "/api/*"
 		return []string{path + "*"}
 	}
-	// "/api" → match "/api" exactly and "/api/*"
 	return []string{path, path + "/*"}
 }
 
 // buildHandlers assembles the ordered handler chain for a route:
-//  1. Security headers (if enabled)
-//  2. Coraza WAF (if enabled)
-//  3. reverse_proxy to upstream
-func buildHandlers(upstream string, sec SecurityConfig) []interface{} {
+//  1. Basic auth (if configured via annotation)
+//  2. Security headers (if enabled in global config)
+//  3. Coraza WAF (if enabled in global config)
+//  4. reverse_proxy to upstream
+func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) []interface{} {
 	var handlers []interface{}
+
+	if ann.basicAuth != nil {
+		handlers = append(handlers, basicAuthHandler(ann.basicAuth))
+	}
 
 	if sec.SecurityHeaders {
 		handlers = append(handlers, securityHeadersHandler())
@@ -139,6 +194,28 @@ func buildHandlers(upstream string, sec SecurityConfig) []interface{} {
 	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP))
 
 	return handlers
+}
+
+// basicAuthHandler returns the Caddy authentication handler JSON for HTTP Basic Auth.
+// Requires bcrypt-hashed passwords (generated with: htpasswd -nbB user pass).
+// The password hash stored in the k8s Secret must use $2y$ or $2a$ prefix.
+func basicAuthHandler(cfg *basicAuthConfig) map[string]interface{} {
+	accounts := make([]map[string]interface{}, 0, len(cfg.accounts))
+	for _, a := range cfg.accounts {
+		accounts = append(accounts, map[string]interface{}{
+			"username": a.Username,
+			"password": a.Password,
+		})
+	}
+	return map[string]interface{}{
+		"handler": "authentication",
+		"providers": map[string]interface{}{
+			"http_basic": map[string]interface{}{
+				"realm":    cfg.realm,
+				"accounts": accounts,
+			},
+		},
+	}
 }
 
 // securityHeadersHandler returns the Caddy headers handler JSON that sets

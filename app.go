@@ -163,7 +163,8 @@ func (a *App) handleAdd(obj interface{}) {
 	}
 	key := ing.Namespace + "/" + ing.Name
 	adm := newAdminClient(a.AdminAPI)
-	routes := convertIngress(ing, a.Security)
+	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
+	routes := convertIngress(ing, a.Security, ann)
 
 	a.mu.Lock()
 	oldIDs := a.routeIDs[key]

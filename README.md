@@ -126,6 +126,66 @@ spec:
 
 ---
 
+## Annotations
+
+All annotations use the `caddy.ingress/` prefix and are set per Ingress resource.
+
+### IP whitelist
+
+Allow only specific CIDRs — all other IPs receive `403 Forbidden`:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/whitelist-source-range: "192.168.1.0/24,10.0.0.0/8"
+```
+
+### IP blocklist
+
+Deny specific CIDRs — all other IPs pass through:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/blocklist-source-range: "1.2.3.4/32,5.6.7.8/32"
+```
+
+Both can be combined. Whitelist is evaluated first, then blocklist.
+
+### Basic auth
+
+Protect a route with HTTP Basic Auth backed by a Kubernetes Secret:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/basic-auth-secret: "my-app-basic-auth"   # Secret name (same namespace)
+    caddy.ingress/basic-auth-realm: "My App"               # optional, default: Restricted
+```
+
+The Secret must have an `auth` key containing htpasswd-formatted entries. **Only bcrypt hashes are supported** (`$2y$` / `$2a$`) — Caddy's `http_basic` provider does not accept MD5 or SHA1.
+
+Create the Secret:
+
+```bash
+# Generate a bcrypt entry
+htpasswd -nbB myuser mysecretpassword
+# → myuser:$2y$05$...
+
+kubectl create secret generic my-app-basic-auth \
+  --from-literal=auth='myuser:$2y$05$...'
+```
+
+Or with multiple users:
+
+```bash
+htpasswd -cbB auth.htpasswd alice password1
+htpasswd -bB  auth.htpasswd bob   password2
+kubectl create secret generic my-app-basic-auth --from-file=auth=auth.htpasswd
+```
+
+---
+
 ## How it works
 
 1. **Start**: the module connects to the Kubernetes API (in-cluster service account or `~/.kube/config`)
@@ -157,6 +217,9 @@ rules:
   - apiGroups: [""]
     resources: ["services", "endpoints"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
