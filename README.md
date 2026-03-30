@@ -171,6 +171,8 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 | `caddy.ingress/limit-rps` | — | Max requests/second per client IP (uses caddy-ratelimit) |
 | `caddy.ingress/basic-auth-secret` | — | Secret name (same namespace) with `auth` htpasswd key |
 | `caddy.ingress/basic-auth-realm` | `Restricted` | WWW-Authenticate realm string |
+| **Plain HTTP** | | |
+| `caddy.ingress/plain-http` | `false` | Route on port 80 (HTTP only, no TLS). Use for internal services or non-resolvable hostnames |
 
 ---
 
@@ -475,6 +477,38 @@ htpasswd -cbB auth.htpasswd alice password1
 htpasswd -bB  auth.htpasswd bob   password2
 kubectl create secret generic my-app-basic-auth --from-file=auth=auth.htpasswd
 ```
+
+---
+
+### Plain HTTP (internal services)
+
+For services on internal networks or with non-publicly-resolvable hostnames, add `caddy.ingress/plain-http: "true"`. The route is injected into the HTTP server (port 80) instead of HTTPS — no TLS, no ACME, no cert required.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: internal-api
+  annotations:
+    caddy.ingress/plain-http: "true"
+spec:
+  ingressClassName: caddy-custom
+  rules:
+    - host: internal-api.corp.local   # not resolvable from the internet
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: internal-api
+                port:
+                  number: 8080
+```
+
+HSTS and security headers are automatically skipped for plain HTTP routes. `X-Forwarded-Proto` is set to `http` and `X-Forwarded-Port` to `80`.
+
+> **Note:** `spec.tls` is ignored for plain HTTP routes — and for HTTPS routes too, since TLS is handled globally by CertMagic or cert-manager CSI, not per-Ingress.
 
 ---
 
