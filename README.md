@@ -19,6 +19,9 @@ Built to pair with [caddy-custom](https://github.com/brdelphus/caddy-custom), a 
   - Permanent 301 redirects replacing the reverse proxy (e.g. `.well-known` → `/remote.php/dav`)
   - Forced HTTP/1.1 to upstream for streaming and WebSocket backends (e.g. AzuraCast)
   - Proxy timeouts, body size limits, IP whitelist/blocklist, Basic Auth
+- `spec.tls` certificate loading from Kubernetes TLS secrets via the admin API — secrets are watched and reloaded automatically on update
+- Optional Redis store for persistent route ID tracking — survives Caddy restarts and prevents stale routes from accumulating
+- `k8s_config_reloader` app: watches a ConfigMap and reloads Caddy config in-place when it changes — replaces Stakater Reloader, no pod restart ever needed
 - Supports `pathType: Prefix`, `Exact`, and `ImplementationSpecific`
 - Caddyfile global block configuration
 - Falls back to `~/.kube/config` for local development
@@ -69,11 +72,62 @@ Add a `k8s_ingress` block to the Caddy global options block:
             security_headers on          # HSTS, X-Content-Type-Options, etc.
             inject_real_ip   on          # X-Real-IP + X-Forwarded-* to upstream
         }
+
+        redis {
+            address  redis.redis.svc.cluster.local:6379   # optional persistent store
+            # password  secret                            # optional
+            # db        0                                 # optional, default: 0
+        }
     }
 }
 ```
 
 The module registers as a `caddy.App` (`k8s_ingress`), so it can also be configured in JSON if preferred.
+
+### Redis store (optional)
+
+By default, the mapping of Ingress keys to Caddy route IDs is kept in memory. If Caddy restarts while an Ingress is deleted, the module can no longer clean up that route and it will accumulate as a stale entry.
+
+With Redis enabled, the mapping is written through on every add/delete and restored from Redis on startup — Caddy picks up where it left off. Redis failures fall back to the in-memory store and are non-fatal.
+
+```
+{
+    k8s_ingress {
+        redis {
+            address   redis.redis.svc.cluster.local:6379
+            password  mysecret   # optional
+            db        0          # optional, default: 0
+        }
+    }
+}
+```
+
+Keys are namespaced by ingress class (e.g. `k8s_ingress:caddy-custom:namespace/name`) so multiple clusters or ingress classes can share the same Redis instance.
+
+---
+
+## ConfigMap reloader
+
+`k8s_config_reloader` is a companion Caddy app that watches a Kubernetes ConfigMap and calls `POST /load` on the admin API when its content changes. This replaces [Stakater Reloader](https://github.com/stakater/Reloader) for Caddyfile-based config — no pod restart is ever needed.
+
+Hash-based deduplication prevents spurious reloads on informer resyncs; the initial sync seeds the hash without triggering a reload.
+
+```
+{
+    k8s_config_reloader {
+        namespace  caddy          # default: pod's own namespace
+        configmap  caddy-config   # required
+        key        Caddyfile      # default: "Caddyfile"
+        admin_api  localhost:2019 # default
+    }
+}
+```
+
+The ConfigMap must contain a valid Caddyfile under the configured key. The reloader POSTs the raw Caddyfile text with `Content-Type: text/caddyfile` to `/load`.
+
+> **Note:** `k8s_config_reloader` requires `get`/`list`/`watch` on `configmaps` in its target namespace. See [RBAC](#rbac) below.
+
+---
 
 ---
 
@@ -103,6 +157,37 @@ spec:
 ```
 
 Routes are resolved to `<service>.<namespace>.svc.cluster.local:<port>` — no cross-namespace lookup needed.
+
+### With TLS certificate from a Secret
+
+Add a `spec.tls` block to load a certificate from a Kubernetes TLS secret. The module reads the secret, pushes the certificate to Caddy via the admin API, and watches the secret for renewals:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nextcloud
+  namespace: nextcloud
+spec:
+  ingressClassName: caddy-custom
+  tls:
+    - hosts:
+        - cloud.example.com
+      secretName: nextcloud-tls      # must be type kubernetes.io/tls
+  rules:
+    - host: cloud.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nextcloud
+                port:
+                  number: 80
+```
+
+The secret must contain `tls.crt` and `tls.key`. For cert-manager-managed certificates this works out of the box — just set `spec.secretName` in the `Certificate` resource to match.
 
 ### Multiple paths on one host
 
@@ -480,6 +565,41 @@ kubectl create secret generic my-app-basic-auth --from-file=auth=auth.htpasswd
 
 ---
 
+### TLS certificates from spec.tls
+
+When an Ingress has a `spec.tls` block referencing a Kubernetes TLS secret, the module loads that certificate into Caddy via the admin API. The secret is watched: if its content changes (e.g. cert renewal), Caddy is updated automatically without a restart.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp
+  namespace: myapp
+spec:
+  ingressClassName: caddy-custom
+  tls:
+    - hosts:
+        - app.example.com
+      secretName: myapp-tls      # must be type kubernetes.io/tls
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp
+                port:
+                  number: 8080
+```
+
+The secret must be of type `kubernetes.io/tls` and contain both `tls.crt` and `tls.key`. If the secret is missing or invalid, the route is still created — only the certificate load is skipped (a warning is logged).
+
+> **Note:** When a certificate is loaded this way, CertMagic will not attempt ACME for those hosts. If an Ingress referencing a secret is deleted and no other Ingress references the same secret, the certificate entry is removed from the tracking map and will be garbage-collected on the next Caddy restart.
+
+---
+
 ### Plain HTTP (internal services)
 
 For services on internal networks or with non-publicly-resolvable hostnames, add `caddy.ingress/plain-http: "true"`. The route is injected into the HTTP server (port 80) instead of HTTPS — no TLS, no ACME, no cert required.
@@ -508,7 +628,7 @@ spec:
 
 HSTS and security headers are automatically skipped for plain HTTP routes. `X-Forwarded-Proto` is set to `http` and `X-Forwarded-Port` to `80`.
 
-> **Note:** `spec.tls` is ignored for plain HTTP routes — and for HTTPS routes too, since TLS is handled globally by CertMagic or cert-manager CSI, not per-Ingress.
+> **Note:** `spec.tls` is ignored for plain HTTP routes — TLS is not applicable.
 
 ---
 
@@ -545,10 +665,14 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # required by k8s_config_reloader
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
