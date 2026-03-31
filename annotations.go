@@ -175,6 +175,24 @@ const (
 	//                  spec.tls.secretName. caddy-k8s loads the cert from it.
 	annotationTLSHandler = "caddy.ingress/tls"
 
+	// Issue this Ingress's cert on-demand (on first TLS connection) instead of
+	// proactively at Ingress creation time. Only applies when
+	// caddy.ingress/tls is "certmagic". Requires the global on-demand config
+	// (ask URL, rate limits) to be set in Helm values.
+	// Value: "true" | "false" (default: "false")
+	annotationTLSOnDemand = "caddy.ingress/tls-ondemand"
+
+	// ACME CA directory URL to use for this Ingress instead of the global default.
+	// Only applies when caddy.ingress/tls is "certmagic".
+	// Example: "https://acme.zerossl.com/v2/DV90"
+	annotationTLSCA = "caddy.ingress/tls-ca"
+
+	// Name of a Kubernetes Secret (same namespace as the Ingress) that holds
+	// External Account Binding credentials for the ACME CA set in tls-ca.
+	// Required for CAs that mandate EAB (ZeroSSL, DigiCert, etc.).
+	// Secret keys: "key_id" and "mac_key".
+	annotationTLSCASecret = "caddy.ingress/tls-ca-secret"
+
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
 	// Name of a k8s Secret (same namespace) whose "auth" key holds htpasswd
@@ -215,8 +233,11 @@ type ingressAnnotations struct {
 	rewriteTarget     string
 	serverAliases     []string
 	limitRPS          int         // 0 = disabled
-	cors       *corsConfig // nil = CORS disabled
-	tlsHandler string      // "certmagic" | "cert-manager" | ""
+	cors         *corsConfig // nil = CORS disabled
+	tlsHandler   string      // "certmagic" | "cert-manager" | ""
+	tlsOnDemand  bool        // issue cert on first connection, not proactively
+	tlsCA        string      // ACME CA URL override (e.g. ZeroSSL)
+	tlsCASecret  string      // K8s Secret name holding EAB key_id + mac_key
 	// wafOverride overrides the global WAF setting for this Ingress.
 	// nil = inherit global; non-nil = use this value.
 	wafOverride *bool
@@ -483,6 +504,12 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 	// ── TLS handler ──────────────────────────────────────────────────────────────
 
 	out.tlsHandler = strings.ToLower(strings.TrimSpace(a[annotationTLSHandler]))
+
+	if strings.EqualFold(strings.TrimSpace(a[annotationTLSOnDemand]), "true") {
+		out.tlsOnDemand = true
+	}
+	out.tlsCA = strings.TrimSpace(a[annotationTLSCA])
+	out.tlsCASecret = strings.TrimSpace(a[annotationTLSCASecret])
 
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 

@@ -60,10 +60,11 @@ type App struct {
 	mu             sync.Mutex
 	store          routeStore
 	// routeIDs is an in-process cache of store contents for fast lookups.
-	routeIDs       map[string][]string
-	serverName     string // resolved at Start() — HTTPS (:443)
-	httpServerName string // resolved at Start() — HTTP (:80), used for ssl-redirect
-	tlsManager     *TLSManager
+	routeIDs        map[string][]string
+	serverName      string // resolved at Start() — HTTPS (:443)
+	httpServerName  string // resolved at Start() — HTTP (:80), used for ssl-redirect
+	tlsManager      *TLSManager
+	tlsPolicyMgr    *TLSPolicyManager
 }
 
 // SecurityConfig controls which security middleware is injected per route.
@@ -179,6 +180,9 @@ func (a *App) Start() error {
 	a.tlsManager = NewTLSManager(client, a.AdminAPI, a.logger)
 	go a.tlsManager.WatchSecrets(context.Background())
 
+	// Initialize TLS policy manager for per-Ingress CertMagic automation policies.
+	a.tlsPolicyMgr = NewTLSPolicyManager(client, a.AdminAPI, a.logger)
+
 	a.logger.Info("k8s_ingress: watching ingresses",
 		zap.String("class", a.IngressClass),
 		zap.String("https_server", a.serverName),
@@ -237,6 +241,18 @@ func (a *App) handleAdd(obj interface{}) {
 	if len(ing.Spec.TLS) > 0 && ann.tlsHandler != "certmagic" {
 		if err := a.tlsManager.LoadFromIngress(context.Background(), ing); err != nil {
 			a.logger.Error("k8s_ingress: failed to load TLS from ingress",
+				zap.String("ingress", key),
+				zap.Error(err),
+			)
+		}
+	}
+
+	// Sync per-Ingress CertMagic automation policy when on-demand or a custom
+	// CA is requested. Plain certmagic (no extra annotations) falls through to
+	// the global automation policy configured in the Caddyfile.
+	if len(ing.Spec.TLS) > 0 && ann.tlsHandler == "certmagic" && (ann.tlsOnDemand || ann.tlsCA != "") {
+		if err := a.tlsPolicyMgr.Sync(context.Background(), ing, ann); err != nil {
+			a.logger.Error("k8s_ingress: failed to sync TLS automation policy",
 				zap.String("ingress", key),
 				zap.Error(err),
 			)
@@ -310,9 +326,12 @@ func (a *App) handleDelete(obj interface{}) {
 	}
 	key := ing.Namespace + "/" + ing.Name
 
-	// Clean up TLS certificates.
+	// Clean up TLS certificates and automation policies.
 	if len(ing.Spec.TLS) > 0 {
 		a.tlsManager.RemoveFromIngress(ing)
+		if err := a.tlsPolicyMgr.Remove(context.Background(), ing); err != nil {
+			a.logger.Warn("k8s_ingress: remove TLS policy", zap.String("ingress", key), zap.Error(err))
+		}
 	}
 
 	adm := newAdminClient(a.AdminAPI)

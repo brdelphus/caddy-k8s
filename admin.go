@@ -138,6 +138,34 @@ func (c *adminClient) do(ctx context.Context, method, path string, body []byte) 
 	return nil
 }
 
+// upsertTLSPolicy creates or updates a TLS automation policy identified by its
+// @id field. Uses PUT /id/<id> if the policy already exists, POST to the
+// policies array otherwise.
+func (c *adminClient) upsertTLSPolicy(ctx context.Context, p tlsAutomationPolicy) error {
+	exists, err := c.routeExists(ctx, p.ID)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("marshal tls policy: %w", err)
+	}
+	if exists {
+		return c.do(ctx, http.MethodPut, "/id/"+p.ID, body)
+	}
+	return c.do(ctx, http.MethodPost, "/config/apps/tls/automation/policies/", body)
+}
+
+// deleteTLSPolicy removes a TLS automation policy by its @id.
+// Returns nil if the policy does not exist.
+func (c *adminClient) deleteTLSPolicy(ctx context.Context, id string) error {
+	exists, err := c.routeExists(ctx, id)
+	if err != nil || !exists {
+		return err
+	}
+	return c.do(ctx, http.MethodDelete, "/id/"+id, nil)
+}
+
 // postJSON sends a JSON payload to the given path via POST.
 func (c *adminClient) postJSON(ctx context.Context, path string, payload interface{}) error {
 	body, err := json.Marshal(payload)
