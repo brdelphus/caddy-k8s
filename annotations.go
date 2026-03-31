@@ -162,13 +162,18 @@ const (
 	// Default: 1728000 (20 days — nginx-ingress default)
 	annotationCORSMaxAge = "caddy.ingress/cors-max-age"
 
-	// ── Plain HTTP ───────────────────────────────────────────────────────────────
+	// ── TLS handler ──────────────────────────────────────────────────────────────
 
-	// Serve this Ingress over plain HTTP (port 80) instead of HTTPS.
-	// Use for internal services on private networks that do not need TLS,
-	// or for hostnames that are not publicly resolvable (so ACME cannot be used).
-	// Value: "true" | "false" (default: "false")
-	annotationPlainHTTP = "caddy.ingress/plain-http"
+	// Declares which TLS handler manages the certificate for this Ingress.
+	// spec.tls is always required for HTTPS — this annotation tells caddy-k8s
+	// how the cert is being provisioned so it can act accordingly.
+	//
+	// Values:
+	//   certmagic    — CertMagic handles issuance via ACME. spec.tls hosts
+	//                  declare the domains; no secretName needed.
+	//   cert-manager — cert-manager creates the Secret referenced in
+	//                  spec.tls.secretName. caddy-k8s loads the cert from it.
+	annotationTLSHandler = "caddy.ingress/tls"
 
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
@@ -210,9 +215,8 @@ type ingressAnnotations struct {
 	rewriteTarget     string
 	serverAliases     []string
 	limitRPS          int         // 0 = disabled
-	cors              *corsConfig // nil = CORS disabled
-	// plainHTTP routes this Ingress to the HTTP server (port 80) instead of HTTPS.
-	plainHTTP bool
+	cors       *corsConfig // nil = CORS disabled
+	tlsHandler string      // "certmagic" | "cert-manager" | ""
 	// wafOverride overrides the global WAF setting for this Ingress.
 	// nil = inherit global; non-nil = use this value.
 	wafOverride *bool
@@ -476,11 +480,9 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 		}
 	}
 
-	// ── Plain HTTP ───────────────────────────────────────────────────────────────
+	// ── TLS handler ──────────────────────────────────────────────────────────────
 
-	if strings.EqualFold(a[annotationPlainHTTP], "true") {
-		out.plainHTTP = true
-	}
+	out.tlsHandler = strings.ToLower(strings.TrimSpace(a[annotationTLSHandler]))
 
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 

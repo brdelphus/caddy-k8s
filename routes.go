@@ -52,7 +52,7 @@ func convertIngress(ing *networkingv1.Ingress, sec SecurityConfig, ann ingressAn
 			upstream := fmt.Sprintf("%s.%s.svc.cluster.local:%d", svc, ing.Namespace, port)
 
 			pathMatch := caddyMatch{Path: convertPath(p.Path, p.PathType)}
-			handlers := buildHandlers(upstream, sec, ann)
+			handlers := buildHandlers(upstream, sec, ann, len(ing.Spec.TLS) == 0)
 			pathRouteID := routeID(ing.Namespace, ing.Name, rule.Host, i)
 
 			var match []caddyMatch
@@ -192,7 +192,7 @@ func convertPath(path string, pt *networkingv1.PathType) []string {
 //  7. Security headers
 //  8. Coraza WAF
 //  9. reverse_proxy
-func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) []interface{} {
+func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations, plainHTTP bool) []interface{} {
 	// Redirect annotations replace the entire handler chain.
 	if ann.permanentRedirect != "" || ann.temporalRedirect != "" {
 		url := ann.permanentRedirect
@@ -220,8 +220,8 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 		// Multiple specific origins: generate a subroute so we only echo back an
 		// origin that is in the allowed list. Uses {http.request.header.Origin}
 		// as the header value exclusively within the matched branch.
-		withCORS := buildCoreHandlers(upstream, sec, ann, true, true)
-		withoutCORS := buildCoreHandlers(upstream, sec, ann, false, false)
+		withCORS := buildCoreHandlers(upstream, sec, ann, plainHTTP, true, true)
+		withoutCORS := buildCoreHandlers(upstream, sec, ann, plainHTTP, false, false)
 		return []interface{}{map[string]interface{}{
 			"handler": "subroute",
 			"routes": []caddyRoute{
@@ -238,7 +238,7 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 		}}
 	}
 
-	return buildCoreHandlers(upstream, sec, ann, cors != nil, false)
+	return buildCoreHandlers(upstream, sec, ann, plainHTTP, cors != nil, false)
 }
 
 // buildCoreHandlers builds the flat handler chain.
@@ -246,7 +246,7 @@ func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations) 
 // dynamic: use {http.request.header.Origin} as the Allow-Origin value instead
 //
 //	of the literal origin (safe only within an origin-matched subroute branch).
-func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations, withCORS bool, dynamic bool) []interface{} {
+func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations, plainHTTP bool, withCORS bool, dynamic bool) []interface{} {
 	var handlers []interface{}
 
 	if withCORS && ann.cors != nil {
@@ -277,7 +277,7 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 
 	// Skip security headers on plain HTTP routes — HSTS on HTTP is incorrect and
 	// ignored by browsers; the other headers are irrelevant for internal services.
-	if sec.SecurityHeaders && !ann.plainHTTP {
+	if sec.SecurityHeaders && !plainHTTP {
 		handlers = append(handlers, securityHeadersHandler())
 	}
 
@@ -294,7 +294,7 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 		handlers = append(handlers, wafHandler(wafMode))
 	}
 
-	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy, ann.plainHTTP))
+	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy, plainHTTP))
 
 	return handlers
 }

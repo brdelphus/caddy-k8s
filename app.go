@@ -228,8 +228,13 @@ func (a *App) handleAdd(obj interface{}) {
 	}
 	key := ing.Namespace + "/" + ing.Name
 
-	// Process spec.tls first to load certificates before routes.
-	if len(ing.Spec.TLS) > 0 {
+	adm := newAdminClient(a.AdminAPI)
+	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
+
+	// Load TLS cert from spec.tls when the handler is cert-manager (or unset
+	// with a secretName present — backwards compatibility).
+	// CertMagic manages its own certs; no loading needed.
+	if len(ing.Spec.TLS) > 0 && ann.tlsHandler != "certmagic" {
 		if err := a.tlsManager.LoadFromIngress(context.Background(), ing); err != nil {
 			a.logger.Error("k8s_ingress: failed to load TLS from ingress",
 				zap.String("ingress", key),
@@ -237,9 +242,6 @@ func (a *App) handleAdd(obj interface{}) {
 			)
 		}
 	}
-
-	adm := newAdminClient(a.AdminAPI)
-	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
 	routes := convertIngress(ing, a.Security, ann)
 
 	// ssl-redirect: also inject HTTP→HTTPS redirect routes on the HTTP server.
@@ -272,11 +274,11 @@ func (a *App) handleAdd(obj interface{}) {
 		}
 	}
 
-	// Plain HTTP ingresses go to the HTTP server, all others to HTTPS.
+	// Ingresses with spec.tls go to the HTTPS server; all others to HTTP.
 	targetServer := a.serverName
-	if ann.plainHTTP {
+	if len(ing.Spec.TLS) == 0 {
 		if a.httpServerName == "" {
-			a.logger.Error("k8s_ingress: plain-http=true but no HTTP server found — route skipped",
+			a.logger.Error("k8s_ingress: no HTTP server found for plain-HTTP ingress — route skipped",
 				zap.String("ingress", key))
 			return
 		}

@@ -158,9 +158,11 @@ spec:
 
 Routes are resolved to `<service>.<namespace>.svc.cluster.local:<port>` — no cross-namespace lookup needed.
 
-### With TLS certificate from a Secret
+### With TLS (HTTPS)
 
-Add a `spec.tls` block to load a certificate from a Kubernetes TLS secret. The module reads the secret, pushes the certificate to Caddy via the admin API, and watches the secret for renewals:
+`spec.tls` is required for HTTPS. Use `caddy.ingress/tls` to declare which handler manages the certificate.
+
+**CertMagic** (no secretName — Caddy issues the cert via ACME):
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -168,12 +170,13 @@ kind: Ingress
 metadata:
   name: nextcloud
   namespace: nextcloud
+  annotations:
+    caddy.ingress/tls: certmagic
 spec:
   ingressClassName: caddy-custom
   tls:
     - hosts:
         - cloud.example.com
-      secretName: nextcloud-tls      # must be type kubernetes.io/tls
   rules:
     - host: cloud.example.com
       http:
@@ -187,7 +190,37 @@ spec:
                   number: 80
 ```
 
-The secret must contain `tls.crt` and `tls.key`. For cert-manager-managed certificates this works out of the box — just set `spec.secretName` in the `Certificate` resource to match.
+**cert-manager** (secretName — cert-manager provisions the Secret, caddy-k8s loads it):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nextcloud
+  namespace: nextcloud
+  annotations:
+    caddy.ingress/tls: cert-manager
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: caddy-custom
+  tls:
+    - hosts:
+        - cloud.example.com
+      secretName: nextcloud-tls   # must exist in namespace nextcloud
+  rules:
+    - host: cloud.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nextcloud
+                port:
+                  number: 80
+```
+
+The Secret must be of type `kubernetes.io/tls`, exist in the **same namespace as the Ingress**, and contain both `tls.crt` and `tls.key`.
 
 ### Multiple paths on one host
 
@@ -249,6 +282,8 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 | `caddy.ingress/cors-expose-headers` | — | Response headers exposed to browser JS |
 | `caddy.ingress/cors-allow-credentials` | `false` | Allow credentials (incompatible with `*` origin) |
 | `caddy.ingress/cors-max-age` | `1728000` | Preflight cache duration in seconds |
+| **TLS** | | |
+| `caddy.ingress/tls` | — | TLS handler: `certmagic` or `cert-manager`. `spec.tls` is always required for HTTPS. |
 | **Security** | | |
 | `caddy.ingress/waf` | — | Per-route WAF override: `off`, `on`, or `detection` |
 | `caddy.ingress/whitelist-source-range` | — | Comma-separated CIDRs to allow; all others get 403 |
@@ -256,8 +291,6 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 | `caddy.ingress/limit-rps` | — | Max requests/second per client IP (uses caddy-ratelimit) |
 | `caddy.ingress/basic-auth-secret` | — | Secret name (same namespace) with `auth` htpasswd key |
 | `caddy.ingress/basic-auth-realm` | `Restricted` | WWW-Authenticate realm string |
-| **Plain HTTP** | | |
-| `caddy.ingress/plain-http` | `false` | Route on port 80 (HTTP only, no TLS). Use for internal services or non-resolvable hostnames |
 
 ---
 
@@ -565,9 +598,47 @@ kubectl create secret generic my-app-basic-auth --from-file=auth=auth.htpasswd
 
 ---
 
-### TLS certificates from spec.tls
+### TLS
 
-When an Ingress has a `spec.tls` block referencing a Kubernetes TLS secret, the module loads that certificate into Caddy via the admin API. The secret is watched: if its content changes (e.g. cert renewal), Caddy is updated automatically without a restart.
+`spec.tls` is always required to route an Ingress to the HTTPS server. The `caddy.ingress/tls` annotation declares which handler manages the certificate.
+
+**CertMagic** — Caddy issues and renews the cert automatically via ACME:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/tls: certmagic
+spec:
+  ingressClassName: caddy-custom
+  tls:
+    - hosts:
+        - app.example.com
+  rules:
+    - host: app.example.com
+      ...
+```
+
+No `secretName` needed. CertMagic sees the hostname in the HTTPS server routes and issues the cert. Requires `tls.acme.enabled: true` in the Caddy Helm values.
+
+**cert-manager** — cert-manager issues the cert and stores it as a Secret:
+
+```yaml
+metadata:
+  annotations:
+    caddy.ingress/tls: cert-manager
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: caddy-custom
+  tls:
+    - hosts:
+        - app.example.com
+      secretName: myapp-tls   # cert-manager creates this; caddy-k8s loads it
+  rules:
+    - host: app.example.com
+      ...
+```
+
+When `caddy.ingress/tls` is set to `cert-manager` (or unset with a `secretName` present), caddy-k8s loads the certificate from the Secret referenced in `spec.tls`. The Secret is watched — renewals are applied automatically without a restart.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -594,41 +665,9 @@ spec:
                   number: 8080
 ```
 
-The secret must be of type `kubernetes.io/tls` and contain both `tls.crt` and `tls.key`. If the secret is missing or invalid, the route is still created — only the certificate load is skipped (a warning is logged).
+The secret must be of type `kubernetes.io/tls`, exist in the **same namespace as the Ingress**, and contain both `tls.crt` and `tls.key`. If the secret is missing or invalid, the route is still created — only the certificate load is skipped (a warning is logged).
 
 > **Note:** If an Ingress referencing a secret is deleted and no other Ingress references the same secret, the certificate entry is removed from the tracking map and will be garbage-collected on the next Caddy restart.
-
----
-
-### Plain HTTP (internal services)
-
-For services on internal networks or with non-publicly-resolvable hostnames, add `caddy.ingress/plain-http: "true"`. The route is injected into the HTTP server (port 80) instead of HTTPS — no TLS, no cert required.
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: internal-api
-  annotations:
-    caddy.ingress/plain-http: "true"
-spec:
-  ingressClassName: caddy-custom
-  rules:
-    - host: internal-api.corp.local   # not resolvable from the internet
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: internal-api
-                port:
-                  number: 8080
-```
-
-HSTS and security headers are automatically skipped for plain HTTP routes. `X-Forwarded-Proto` is set to `http` and `X-Forwarded-Port` to `80`.
-
-> **Note:** `spec.tls` is ignored for plain HTTP routes — TLS is not applicable.
 
 ---
 
