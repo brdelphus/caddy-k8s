@@ -281,6 +281,12 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 		handlers = append(handlers, securityHeadersHandler())
 	}
 
+	// Per-Ingress response headers (set/delete). Runs after security headers so
+	// it can override them if needed.
+	if !ann.responseHeaders.empty() {
+		handlers = append(handlers, responseHeadersHandler(ann.responseHeaders))
+	}
+
 	// WAF: per-route annotation overrides the global SecurityConfig setting.
 	wafEnabled := sec.WAF
 	wafMode := sec.WAFMode
@@ -294,7 +300,7 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 		handlers = append(handlers, wafHandler(wafMode))
 	}
 
-	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy, plainHTTP))
+	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy, plainHTTP, ann.requestHeaders))
 
 	return handlers
 }
@@ -421,6 +427,26 @@ func securityHeadersHandler() map[string]interface{} {
 	}
 }
 
+// responseHeadersHandler returns a Caddy headers handler that sets and/or
+// deletes response headers as specified by the per-Ingress annotation.
+func responseHeadersHandler(cfg headerConfig) map[string]interface{} {
+	resp := map[string]interface{}{}
+	if len(cfg.set) > 0 {
+		set := make(map[string][]string, len(cfg.set))
+		for k, v := range cfg.set {
+			set[k] = []string{v}
+		}
+		resp["set"] = set
+	}
+	if len(cfg.delete) > 0 {
+		resp["delete"] = cfg.delete
+	}
+	return map[string]interface{}{
+		"handler":  "headers",
+		"response": resp,
+	}
+}
+
 // wafHandler returns the Coraza WAF handler JSON.
 func wafHandler(mode string) map[string]interface{} {
 	ruleEngine := "DetectionOnly"
@@ -440,8 +466,8 @@ func wafHandler(mode string) map[string]interface{} {
 }
 
 // reverseProxyHandler returns the Caddy reverse_proxy handler JSON, applying
-// any per-Ingress proxy timeouts and real-IP header injection.
-func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig, plainHTTP bool) map[string]interface{} {
+// any per-Ingress proxy timeouts, real-IP injection, and custom request headers.
+func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig, plainHTTP bool, reqHdrs headerConfig) map[string]interface{} {
 	h := map[string]interface{}{
 		"handler": "reverse_proxy",
 		"upstreams": []map[string]interface{}{
@@ -500,11 +526,22 @@ func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig, 
 	if proxy.xForwardedPrefix != "" {
 		reqHeaders["X-Forwarded-Prefix"] = []string{proxy.xForwardedPrefix}
 	}
+	// Merge per-Ingress custom request headers (annotation overrides same-named
+	// built-in headers like X-Forwarded-For if explicitly set).
+	for k, v := range reqHdrs.set {
+		reqHeaders[k] = []string{v}
+	}
+
+	reqSection := map[string]interface{}{}
 	if len(reqHeaders) > 0 {
+		reqSection["set"] = reqHeaders
+	}
+	if len(reqHdrs.delete) > 0 {
+		reqSection["delete"] = reqHdrs.delete
+	}
+	if len(reqSection) > 0 {
 		h["headers"] = map[string]interface{}{
-			"request": map[string]interface{}{
-				"set": reqHeaders,
-			},
+			"request": reqSection,
 		}
 	}
 

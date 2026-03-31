@@ -282,6 +282,11 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 | `caddy.ingress/cors-expose-headers` | — | Response headers exposed to browser JS |
 | `caddy.ingress/cors-allow-credentials` | `false` | Allow credentials (incompatible with `*` origin) |
 | `caddy.ingress/cors-max-age` | `1728000` | Preflight cache duration in seconds |
+| **Observability** | | |
+| `caddy.ingress/access-log` | `true` | Set to `"false"` to suppress access logs for this Ingress. Only applies when `access_log on` is set globally. |
+| **Headers** | | |
+| `caddy.ingress/request-headers` | — | Set/delete headers on upstream requests. Format: `Key=Value,Key2=Value2,-DeleteKey`. Caddy placeholders allowed. |
+| `caddy.ingress/response-headers` | — | Set/delete headers on client responses. Same format. Runs after security headers so it can override them. |
 | **TLS** | | |
 | `caddy.ingress/tls` | — | TLS handler: `certmagic` or `cert-manager`. `spec.tls` is always required for HTTPS. |
 | **Security** | | |

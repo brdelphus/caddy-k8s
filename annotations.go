@@ -162,6 +162,29 @@ const (
 	// Default: 1728000 (20 days — nginx-ingress default)
 	annotationCORSMaxAge = "caddy.ingress/cors-max-age"
 
+	// ── Custom headers ───────────────────────────────────────────────────────────
+
+	// ── Access logging ───────────────────────────────────────────────────────────
+
+	// Disable HTTP access logging for this Ingress. Only meaningful when
+	// access_log is enabled globally in the k8s_ingress Caddyfile block.
+	// Value: "true" | "false" (default: "true" — inherit global setting)
+	annotationAccessLog = "caddy.ingress/access-log"
+
+	// ── Custom headers ───────────────────────────────────────────────────────────
+
+	// Comma-separated list of headers to set on requests forwarded to the upstream.
+	// Format: "Key=Value,Key2=Value2,-KeyToDelete"
+	// Prefix with "-" to delete a header before forwarding.
+	// Values may contain Caddy placeholders, e.g. "{client_ip}".
+	annotationRequestHeaders = "caddy.ingress/request-headers"
+
+	// Comma-separated list of headers to set on responses sent to the client.
+	// Format: "Key=Value,Key2=Value2,-KeyToDelete"
+	// Prefix with "-" to delete a header from the response.
+	// Values may contain Caddy placeholders, e.g. "{http.request.host}".
+	annotationResponseHeaders = "caddy.ingress/response-headers"
+
 	// ── TLS handler ──────────────────────────────────────────────────────────────
 
 	// Declares which TLS handler manages the certificate for this Ingress.
@@ -204,6 +227,35 @@ const (
 	annotationBasicAuthRealm = "caddy.ingress/basic-auth-realm"
 )
 
+// headerConfig holds parsed header set/delete instructions from annotations.
+type headerConfig struct {
+	set    map[string]string // header name → value (Caddy placeholders allowed)
+	delete []string          // header names to remove
+}
+
+func (h headerConfig) empty() bool {
+	return len(h.set) == 0 && len(h.delete) == 0
+}
+
+// parseHeaderAnnotation parses a comma-separated "Key=Value,-DeleteKey" string.
+func parseHeaderAnnotation(raw string) headerConfig {
+	cfg := headerConfig{set: make(map[string]string)}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, "-") {
+			if name := strings.TrimSpace(part[1:]); name != "" {
+				cfg.delete = append(cfg.delete, name)
+			}
+		} else if k, v, ok := strings.Cut(part, "="); ok {
+			cfg.set[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return cfg
+}
+
 // corsConfig holds parsed CORS annotation values.
 type corsConfig struct {
 	origins       []string // ["*"] or one or more specific origins
@@ -233,8 +285,11 @@ type ingressAnnotations struct {
 	rewriteTarget     string
 	serverAliases     []string
 	limitRPS          int         // 0 = disabled
-	cors         *corsConfig // nil = CORS disabled
-	tlsHandler   string      // "certmagic" | "cert-manager" | ""
+	cors              *corsConfig  // nil = CORS disabled
+	accessLogDisabled bool         // suppress access logs for this Ingress
+	requestHeaders    headerConfig // headers to set/delete on upstream requests
+	responseHeaders   headerConfig // headers to set/delete on client responses
+	tlsHandler      string       // "certmagic" | "cert-manager" | ""
 	tlsOnDemand  bool        // issue cert on first connection, not proactively
 	tlsCA        string      // ACME CA URL override (e.g. ZeroSSL)
 	tlsCASecret  string      // K8s Secret name holding EAB key_id + mac_key
@@ -499,6 +554,21 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 				zap.String("value", v),
 			)
 		}
+	}
+
+	// ── Access logging ───────────────────────────────────────────────────────────
+
+	if strings.EqualFold(strings.TrimSpace(a[annotationAccessLog]), "false") {
+		out.accessLogDisabled = true
+	}
+
+	// ── Custom headers ───────────────────────────────────────────────────────────
+
+	if raw := a[annotationRequestHeaders]; raw != "" {
+		out.requestHeaders = parseHeaderAnnotation(raw)
+	}
+	if raw := a[annotationResponseHeaders]; raw != "" {
+		out.responseHeaders = parseHeaderAnnotation(raw)
 	}
 
 	// ── TLS handler ──────────────────────────────────────────────────────────────

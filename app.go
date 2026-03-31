@@ -54,6 +54,11 @@ type App struct {
 	// Kubernetes API on every restart, but orphaned routes may accumulate).
 	Redis *RedisConfig `json:"redis,omitempty"`
 
+	// AccessLog enables HTTP access logging for all Ingress-generated routes.
+	// Caddy writes one JSON log line per request to stderr. Individual Ingresses
+	// can suppress logging via the caddy.ingress/access-log: "false" annotation.
+	AccessLog bool `json:"access_log,omitempty"`
+
 	logger         *zap.Logger
 	client         kubernetes.Interface
 	stopCh         chan struct{}
@@ -65,6 +70,7 @@ type App struct {
 	httpServerName  string // resolved at Start() — HTTP (:80), used for ssl-redirect
 	tlsManager      *TLSManager
 	tlsPolicyMgr    *TLSPolicyManager
+	accessLogMgr    *accessLogManager
 }
 
 // SecurityConfig controls which security middleware is injected per route.
@@ -183,6 +189,14 @@ func (a *App) Start() error {
 	// Initialize TLS policy manager for per-Ingress CertMagic automation policies.
 	a.tlsPolicyMgr = NewTLSPolicyManager(client, a.AdminAPI, a.logger)
 
+	// Initialize access log manager and enable server-level access logging.
+	if a.AccessLog {
+		a.accessLogMgr = newAccessLogManager(a.serverName, a.AdminAPI, a.logger)
+		if err := a.accessLogMgr.Enable(context.Background()); err != nil {
+			a.logger.Error("k8s_ingress: failed to enable access logging", zap.Error(err))
+		}
+	}
+
 	a.logger.Info("k8s_ingress: watching ingresses",
 		zap.String("class", a.IngressClass),
 		zap.String("https_server", a.serverName),
@@ -244,6 +258,20 @@ func (a *App) handleAdd(obj interface{}) {
 				zap.String("ingress", key),
 				zap.Error(err),
 			)
+		}
+	}
+
+	// Per-Ingress access log suppression.
+	if a.accessLogMgr != nil {
+		hosts := ingressHosts(ing)
+		if ann.accessLogDisabled && len(hosts) > 0 {
+			if err := a.accessLogMgr.Skip(context.Background(), key, hosts); err != nil {
+				a.logger.Warn("k8s_ingress: skip access log", zap.String("ingress", key), zap.Error(err))
+			}
+		} else {
+			if err := a.accessLogMgr.Unskip(context.Background(), key); err != nil {
+				a.logger.Warn("k8s_ingress: unskip access log", zap.String("ingress", key), zap.Error(err))
+			}
 		}
 	}
 
@@ -334,6 +362,13 @@ func (a *App) handleDelete(obj interface{}) {
 		}
 	}
 
+	// Remove access log suppression for deleted Ingress.
+	if a.accessLogMgr != nil {
+		if err := a.accessLogMgr.Unskip(context.Background(), key); err != nil {
+			a.logger.Warn("k8s_ingress: unskip access log on delete", zap.String("ingress", key), zap.Error(err))
+		}
+	}
+
 	adm := newAdminClient(a.AdminAPI)
 
 	a.mu.Lock()
@@ -352,6 +387,19 @@ func (a *App) handleDelete(obj interface{}) {
 	}
 
 	a.logger.Info("k8s_ingress: removed ingress", zap.String("ingress", key))
+}
+
+// ingressHosts returns all unique hostnames from the Ingress spec.rules.
+func ingressHosts(ing *networkingv1.Ingress) []string {
+	seen := make(map[string]bool)
+	var hosts []string
+	for _, rule := range ing.Spec.Rules {
+		if rule.Host != "" && !seen[rule.Host] {
+			seen[rule.Host] = true
+			hosts = append(hosts, rule.Host)
+		}
+	}
+	return hosts
 }
 
 func stringSet(ids []string) map[string]bool {
