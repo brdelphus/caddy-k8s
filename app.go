@@ -63,6 +63,7 @@ type App struct {
 	routeIDs       map[string][]string
 	serverName     string // resolved at Start() — HTTPS (:443)
 	httpServerName string // resolved at Start() — HTTP (:80), used for ssl-redirect
+	tlsManager     *TLSManager
 }
 
 // SecurityConfig controls which security middleware is injected per route.
@@ -174,6 +175,10 @@ func (a *App) Start() error {
 		a.logger.Info("k8s_ingress: restored route IDs from store", zap.Int("ingresses", len(stored)))
 	}
 
+	// Initialize TLS manager for spec.tls support.
+	a.tlsManager = NewTLSManager(client, a.AdminAPI, a.logger)
+	go a.tlsManager.WatchSecrets(context.Background())
+
 	a.logger.Info("k8s_ingress: watching ingresses",
 		zap.String("class", a.IngressClass),
 		zap.String("https_server", a.serverName),
@@ -200,6 +205,9 @@ func (a *App) Start() error {
 // Stop shuts down the informer and closes the store connection.
 func (a *App) Stop() error {
 	close(a.stopCh)
+	if a.tlsManager != nil {
+		a.tlsManager.Stop()
+	}
 	if err := a.store.close(); err != nil {
 		a.logger.Warn("k8s_ingress: store close", zap.Error(err))
 	}
@@ -219,6 +227,17 @@ func (a *App) handleAdd(obj interface{}) {
 		return
 	}
 	key := ing.Namespace + "/" + ing.Name
+
+	// Process spec.tls first to load certificates before routes.
+	if len(ing.Spec.TLS) > 0 {
+		if err := a.tlsManager.LoadFromIngress(context.Background(), ing); err != nil {
+			a.logger.Error("k8s_ingress: failed to load TLS from ingress",
+				zap.String("ingress", key),
+				zap.Error(err),
+			)
+		}
+	}
+
 	adm := newAdminClient(a.AdminAPI)
 	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
 	routes := convertIngress(ing, a.Security, ann)
@@ -288,6 +307,12 @@ func (a *App) handleDelete(obj interface{}) {
 		return
 	}
 	key := ing.Namespace + "/" + ing.Name
+
+	// Clean up TLS certificates.
+	if len(ing.Spec.TLS) > 0 {
+		a.tlsManager.RemoveFromIngress(ing)
+	}
+
 	adm := newAdminClient(a.AdminAPI)
 
 	a.mu.Lock()

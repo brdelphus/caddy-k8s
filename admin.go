@@ -137,3 +137,12 @@ func (c *adminClient) do(ctx context.Context, method, path string, body []byte) 
 	}
 	return nil
 }
+
+// postJSON sends a JSON payload to the given path via POST.
+func (c *adminClient) postJSON(ctx context.Context, path string, payload interface{}) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+	return c.do(ctx, http.MethodPost, path, body)
+}
