@@ -596,13 +596,13 @@ spec:
 
 The secret must be of type `kubernetes.io/tls` and contain both `tls.crt` and `tls.key`. If the secret is missing or invalid, the route is still created — only the certificate load is skipped (a warning is logged).
 
-> **Note:** When a certificate is loaded this way, CertMagic will not attempt ACME for those hosts. If an Ingress referencing a secret is deleted and no other Ingress references the same secret, the certificate entry is removed from the tracking map and will be garbage-collected on the next Caddy restart.
+> **Note:** If an Ingress referencing a secret is deleted and no other Ingress references the same secret, the certificate entry is removed from the tracking map and will be garbage-collected on the next Caddy restart.
 
 ---
 
 ### Plain HTTP (internal services)
 
-For services on internal networks or with non-publicly-resolvable hostnames, add `caddy.ingress/plain-http: "true"`. The route is injected into the HTTP server (port 80) instead of HTTPS — no TLS, no ACME, no cert required.
+For services on internal networks or with non-publicly-resolvable hostnames, add `caddy.ingress/plain-http: "true"`. The route is injected into the HTTP server (port 80) instead of HTTPS — no TLS, no cert required.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
