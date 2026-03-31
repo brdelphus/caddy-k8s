@@ -2,7 +2,7 @@
 
 A [Caddy](https://caddyserver.com) module that turns Caddy into a Kubernetes Ingress controller. It watches `Ingress` resources with a matching `ingressClassName` and dynamically inserts and removes routes into the running Caddy instance via the admin API — no restarts, no manual Caddyfile editing.
 
-Built to pair with [caddy-custom](https://github.com/brdelphus/caddy-custom), a production Caddy image that bundles WAF, L4 routing, rate limiting, GeoIP blocking, CrowdSec, and more.
+Built to pair with [caddy-custom](https://github.com/brdelphus/caddy-custom), a Caddy image that bundles WAF, L4 routing, rate limiting, GeoIP blocking, CrowdSec, and more. Both projects are under active development — not yet recommended for production use.
 
 ---
 
@@ -44,7 +44,7 @@ xcaddy build \
   --with github.com/brdelphus/caddy-k8s
 ```
 
-Or alongside other plugins (see [caddy-custom](https://github.com/brdelphus/caddy-custom) for the full production build):
+Or alongside other plugins (see [caddy-custom](https://github.com/brdelphus/caddy-custom) for a full build with all plugins):
 
 ```bash
 xcaddy build \
@@ -683,7 +683,7 @@ The secret must be of type `kubernetes.io/tls`, exist in the **same namespace as
 
 ## RBAC
 
-The module needs read access to `Ingress` resources. When deploying with [caddy-custom](https://github.com/brdelphus/caddy-custom)'s Helm chart, the `ClusterRole` and `ClusterRoleBinding` are created automatically when `k8sIngress.enabled: true`.
+The module needs read access to `Ingress` resources. When deploying with [caddy-custom](https://github.com/brdelphus/caddy-custom)'s Helm chart, the `ClusterRole` and `ClusterRoleBinding` are created automatically.
 
 For manual deployments:
 
