@@ -448,20 +448,27 @@ func responseHeadersHandler(cfg headerConfig) map[string]interface{} {
 }
 
 // wafHandler returns the Coraza WAF handler JSON.
+//
+// Include ordering matters: @coraza.conf-recommended sets SecRuleEngine
+// DetectionOnly; @crs-setup and @owasp_crs must be included before the
+// SecRuleEngine override so the final value is ours, not the CRS default.
 func wafHandler(mode string) map[string]interface{} {
 	ruleEngine := "DetectionOnly"
 	if strings.EqualFold(mode, "On") {
 		ruleEngine = "On"
 	}
 	return map[string]interface{}{
-		"handler": "waf",
+		"handler":        "waf",
+		"load_owasp_crs": true,
 		"directives": []string{
+			"Include @coraza.conf-recommended",
+			"Include @crs-setup.conf.example",
+			"Include @owasp_crs/*.conf",
 			fmt.Sprintf("SecRuleEngine %s", ruleEngine),
 			"SecRequestBodyAccess On",
 			"SecResponseBodyAccess Off",
 			"SecRequestBodyLimit 13107200",
 		},
-		"load_owasp_crs": true,
 	}
 }
 
