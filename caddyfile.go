@@ -18,7 +18,7 @@ func init() {
 //
 //	{
 //	    k8s_ingress {
-//	        ingress_class  caddy-custom
+//	        ingress_class  caddy
 //	        server_name    https
 //	        security {
 //	            waf              off

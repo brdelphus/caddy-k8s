@@ -83,7 +83,7 @@ type RedisConfig struct {
 
 type redisStore struct {
 	client    *redis.Client
-	keyPrefix string // e.g. "k8s_ingress:caddy-custom:"
+	keyPrefix string // e.g. "k8s_ingress:caddy:"
 }
 
 func newRedisStore(cfg *RedisConfig, ingressClass string) (*redisStore, error) {

@@ -2,13 +2,13 @@
 
 A [Caddy](https://caddyserver.com) module that turns Caddy into a Kubernetes Ingress controller. It watches `Ingress` resources with a matching `ingressClassName` and dynamically inserts and removes routes into the running Caddy instance via the admin API — no restarts, no manual Caddyfile editing.
 
-Built to pair with [caddy-custom](https://github.com/brdelphus/caddy-custom), a Caddy image that bundles WAF, L4 routing, rate limiting, GeoIP blocking, CrowdSec, and more. Both projects are under active development — not yet recommended for production use.
+Built to pair with [ingress-caddy](https://github.com/brdelphus/ingress-caddy), a Caddy image that bundles WAF, L4 routing, rate limiting, GeoIP blocking, CrowdSec, and more. Both projects are under active development — not yet recommended for production use.
 
 ---
 
 ## Features
 
-- Watches Kubernetes `Ingress` resources using `ingressClassName: caddy-custom` (or the legacy `kubernetes.io/ingress.class` annotation)
+- Watches Kubernetes `Ingress` resources using `ingressClassName: caddy` (or the legacy `kubernetes.io/ingress.class` annotation)
 - Routes appear in Caddy **within seconds** of creating or updating an Ingress — zero-downtime, no reload needed
 - Per-route security middleware injection:
   - Security headers (HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, removes `Server`)
@@ -44,7 +44,7 @@ xcaddy build \
   --with github.com/brdelphus/caddy-k8s
 ```
 
-Or alongside other plugins (see [caddy-custom](https://github.com/brdelphus/caddy-custom) for a full build with all plugins):
+Or alongside other plugins (see [ingress-caddy](https://github.com/brdelphus/ingress-caddy) for a full build with all plugins):
 
 ```bash
 xcaddy build \
@@ -62,7 +62,7 @@ Add a `k8s_ingress` block to the Caddy global options block:
 ```
 {
     k8s_ingress {
-        ingress_class    caddy-custom     # default
+        ingress_class    caddy     # default
         server_name      https            # optional, auto-detected from :443 if omitted
         admin_api        localhost:2019   # default
 
@@ -102,7 +102,7 @@ With Redis enabled, the mapping is written through on every add/delete and resto
 }
 ```
 
-Keys are namespaced by ingress class (e.g. `k8s_ingress:caddy-custom:namespace/name`) so multiple clusters or ingress classes can share the same Redis instance.
+Keys are namespaced by ingress class (e.g. `k8s_ingress:caddy:namespace/name`) so multiple clusters or ingress classes can share the same Redis instance.
 
 ---
 
@@ -142,7 +142,7 @@ metadata:
   name: nextcloud
   namespace: nextcloud
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   rules:
     - host: cloud.example.com
       http:
@@ -173,7 +173,7 @@ metadata:
   annotations:
     caddy.ingress/tls: certmagic
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   tls:
     - hosts:
         - cloud.example.com
@@ -202,7 +202,7 @@ metadata:
     caddy.ingress/tls: cert-manager
     cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   tls:
     - hosts:
         - cloud.example.com
@@ -226,7 +226,7 @@ The Secret must be of type `kubernetes.io/tls`, exist in the **same namespace as
 
 ```yaml
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   rules:
     - host: app.example.com
       http:
@@ -383,7 +383,7 @@ metadata:
   annotations:
     caddy.ingress/permanent-redirect: "https://dav.example.com/remote.php/dav"
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   rules:
     - host: dav.example.com
       http:
@@ -614,7 +614,7 @@ metadata:
   annotations:
     caddy.ingress/tls: certmagic
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   tls:
     - hosts:
         - app.example.com
@@ -633,7 +633,7 @@ metadata:
     caddy.ingress/tls: cert-manager
     cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   tls:
     - hosts:
         - app.example.com
@@ -652,7 +652,7 @@ metadata:
   name: myapp
   namespace: myapp
 spec:
-  ingressClassName: caddy-custom
+  ingressClassName: caddy
   tls:
     - hosts:
         - app.example.com
@@ -688,7 +688,7 @@ The secret must be of type `kubernetes.io/tls`, exist in the **same namespace as
 
 ## RBAC
 
-The module needs read access to `Ingress` resources. When deploying with [caddy-custom](https://github.com/brdelphus/caddy-custom)'s Helm chart, the `ClusterRole` and `ClusterRoleBinding` are created automatically.
+The module needs read access to `Ingress` resources. When deploying with [ingress-caddy](https://github.com/brdelphus/ingress-caddy)'s Helm chart, the `ClusterRole` and `ClusterRoleBinding` are created automatically.
 
 For manual deployments:
 
@@ -744,12 +744,12 @@ This module stands on the shoulders of excellent open-source projects:
 | [xcaddy](https://github.com/caddyserver/xcaddy) | Caddy team | Plugin build tool |
 | [client-go](https://github.com/kubernetes/client-go) | Kubernetes Authors | Kubernetes API client and informer framework |
 | [coraza-caddy](https://github.com/corazawaf/coraza-caddy) | [Coraza](https://github.com/corazawaf) / [jcchavezs](https://github.com/jcchavezs) | WAF handler injected per route (optional) |
-| [caddy-l4](https://github.com/mholt/caddy-l4) | [Matt Holt](https://github.com/mholt) | Layer 4 TCP/UDP routing (used in caddy-custom) |
-| [caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) | [Matt Holt](https://github.com/mholt) | Sliding-window rate limiting (used in caddy-custom) |
-| [cache-handler](https://github.com/caddyserver/cache-handler) | [Caddy / Sylvain Combraque](https://github.com/darkweak) | RFC 7234 HTTP cache via Souin (used in caddy-custom) |
-| [caddy-maxmind-geolocation](https://github.com/porech/caddy-maxmind-geolocation) | [Massimiliano Porrini](https://github.com/porech) | GeoIP country blocking (used in caddy-custom) |
-| [caddy-crowdsec-bouncer](https://github.com/hslatman/caddy-crowdsec-bouncer) | [Herman Slatman](https://github.com/hslatman) | CrowdSec IP reputation + AppSec (used in caddy-custom) |
-| [caddy-defender](https://github.com/jasonlovesdoggo/caddy-defender) | [Jason Cameron](https://github.com/jasonlovesdoggo) | AI scraper / cloud IP blocking (used in caddy-custom) |
+| [caddy-l4](https://github.com/mholt/caddy-l4) | [Matt Holt](https://github.com/mholt) | Layer 4 TCP/UDP routing (used in ingress-caddy) |
+| [caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) | [Matt Holt](https://github.com/mholt) | Sliding-window rate limiting (used in ingress-caddy) |
+| [cache-handler](https://github.com/caddyserver/cache-handler) | [Caddy / Sylvain Combraque](https://github.com/darkweak) | RFC 7234 HTTP cache via Souin (used in ingress-caddy) |
+| [caddy-maxmind-geolocation](https://github.com/porech/caddy-maxmind-geolocation) | [Massimiliano Porrini](https://github.com/porech) | GeoIP country blocking (used in ingress-caddy) |
+| [caddy-crowdsec-bouncer](https://github.com/hslatman/caddy-crowdsec-bouncer) | [Herman Slatman](https://github.com/hslatman) | CrowdSec IP reputation + AppSec (used in ingress-caddy) |
+| [caddy-defender](https://github.com/jasonlovesdoggo/caddy-defender) | [Jason Cameron](https://github.com/jasonlovesdoggo) | AI scraper / cloud IP blocking (used in ingress-caddy) |
 | [go.uber.org/zap](https://github.com/uber-go/zap) | Uber | Structured logging |
 
 ---

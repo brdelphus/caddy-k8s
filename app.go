@@ -29,7 +29,7 @@ func init() {
 // routes into the running Caddy HTTP server via the admin API.
 type App struct {
 	// IngressClass is the value of spec.ingressClassName (or the legacy
-	// kubernetes.io/ingress.class annotation) to watch. Default: caddy-custom.
+	// kubernetes.io/ingress.class annotation) to watch. Default: caddy.
 	IngressClass string `json:"ingress_class,omitempty"`
 
 	// ServerName is the name of the Caddy HTTP server block to inject HTTPS
@@ -100,7 +100,7 @@ func (*App) CaddyModule() caddy.ModuleInfo {
 func (a *App) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
 	if a.IngressClass == "" {
-		a.IngressClass = "caddy-custom"
+		a.IngressClass = "caddy"
 	}
 	if a.AdminAPI == "" {
 		a.AdminAPI = "localhost:2019"
