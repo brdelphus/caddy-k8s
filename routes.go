@@ -297,7 +297,7 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 		}
 	}
 	if wafEnabled {
-		handlers = append(handlers, wafHandler(wafMode))
+		handlers = append(handlers, wafHandler(wafMode, ann.wafDirectives))
 	}
 
 	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy, plainHTTP, ann.requestHeaders))
@@ -452,23 +452,30 @@ func responseHeadersHandler(cfg headerConfig) map[string]interface{} {
 // Include ordering matters: @coraza.conf-recommended sets SecRuleEngine
 // DetectionOnly; @crs-setup and @owasp_crs must be included before the
 // SecRuleEngine override so the final value is ours, not the CRS default.
-func wafHandler(mode string) map[string]interface{} {
+// Per-Ingress extraDirectives (e.g. SecRuleRemoveById, custom SecRule entries)
+// are injected after the CRS Includes so they operate on already-defined rules,
+// but before SecRuleEngine so they cannot override the enforcement mode.
+func wafHandler(mode string, extraDirectives []string) map[string]interface{} {
 	ruleEngine := "DetectionOnly"
 	if strings.EqualFold(mode, "On") {
 		ruleEngine = "On"
 	}
+	directives := []string{
+		"Include @coraza.conf-recommended",
+		"Include @crs-setup.conf.example",
+		"Include @owasp_crs/*.conf",
+	}
+	directives = append(directives, extraDirectives...)
+	directives = append(directives,
+		fmt.Sprintf("SecRuleEngine %s", ruleEngine),
+		"SecRequestBodyAccess On",
+		"SecResponseBodyAccess Off",
+		"SecRequestBodyLimit 13107200",
+	)
 	return map[string]interface{}{
 		"handler":        "waf",
 		"load_owasp_crs": true,
-		"directives": []string{
-			"Include @coraza.conf-recommended",
-			"Include @crs-setup.conf.example",
-			"Include @owasp_crs/*.conf",
-			fmt.Sprintf("SecRuleEngine %s", ruleEngine),
-			"SecRequestBodyAccess On",
-			"SecResponseBodyAccess Off",
-			"SecRequestBodyLimit 13107200",
-		},
+		"directives":     directives,
 	}
 }
 

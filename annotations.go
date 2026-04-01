@@ -216,6 +216,17 @@ const (
 	// Secret keys: "key_id" and "mac_key".
 	annotationTLSCASecret = "caddy.ingress/tls-ca-secret"
 
+	// ── WAF per-Ingress rules ─────────────────────────────────────────────────────
+
+	// Name of a ConfigMap (same namespace as the Ingress) whose "directives" key
+	// contains Coraza SecRule directives to apply only to this Ingress's WAF
+	// handler. Directives are injected after the OWASP CRS Includes so that
+	// SecRuleRemoveById, SecRuleUpdateTargetById, and custom SecRule entries work
+	// against already-defined rules. SecRuleEngine is applied last and cannot be
+	// overridden here.
+	// Value: ConfigMap name, e.g. "myapp-waf-rules"
+	annotationWAFRulesConfigMap = "caddy.ingress/waf-rules-configmap"
+
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
 	// Name of a k8s Secret (same namespace) whose "auth" key holds htpasswd
@@ -299,6 +310,9 @@ type ingressAnnotations struct {
 	// wafModeOverride overrides the global WAF mode when wafOverride is non-nil.
 	// Empty = use global WAFMode.
 	wafModeOverride string
+	// wafDirectives holds extra Coraza directives loaded from the ConfigMap named
+	// by caddy.ingress/waf-rules-configmap. Injected after OWASP CRS Includes.
+	wafDirectives []string
 	proxy             proxyConfig
 	basicAuth         *basicAuthConfig
 }
@@ -556,6 +570,21 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 		}
 	}
 
+	// ── WAF per-Ingress rules ─────────────────────────────────────────────────────
+
+	if cmName := strings.TrimSpace(a[annotationWAFRulesConfigMap]); cmName != "" {
+		directives, err := fetchWAFDirectives(ctx, client, ing.Namespace, cmName)
+		if err != nil {
+			log.Warn("k8s_ingress: waf-rules-configmap fetch failed — WAF will use default rules only",
+				zap.String("ingress", ing.Namespace+"/"+ing.Name),
+				zap.String("configmap", cmName),
+				zap.Error(err),
+			)
+		} else {
+			out.wafDirectives = directives
+		}
+	}
+
 	// ── Access logging ───────────────────────────────────────────────────────────
 
 	if strings.EqualFold(strings.TrimSpace(a[annotationAccessLog]), "false") {
@@ -660,6 +689,31 @@ func parseBodySize(s string) (int64, error) {
 		return 0, fmt.Errorf("parse %q: %w", s, err)
 	}
 	return n * multiplier, nil
+}
+
+// fetchWAFDirectives reads a ConfigMap and returns the lines from its
+// "directives" key as a slice, one Coraza directive per element.
+// Empty lines and lines beginning with "#" are stripped.
+func fetchWAFDirectives(ctx context.Context, client kubernetes.Interface, namespace, cmName string) ([]string, error) {
+	cm, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, cmName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get configmap %s/%s: %w", namespace, cmName, err)
+	}
+
+	raw, ok := cm.Data["directives"]
+	if !ok {
+		return nil, fmt.Errorf("configmap %s/%s has no 'directives' key", namespace, cmName)
+	}
+
+	var out []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, nil
 }
 
 // fetchBasicAuthAccounts reads a Kubernetes Secret and parses its "auth" key

@@ -247,6 +247,23 @@ func (a *App) handleAdd(obj interface{}) {
 	key := ing.Namespace + "/" + ing.Name
 
 	adm := newAdminClient(a.AdminAPI)
+
+	// When WAF is enabled and no waf-rules-configmap annotation is set yet,
+	// create the ConfigMap with default directives and patch the Ingress.
+	// Inject the CM name into the local Ingress copy so resolveAnnotations
+	// picks it up in this same sync cycle without waiting for the next event.
+	if cmName, err := a.ensureWAFConfigMap(context.Background(), ing); err != nil {
+		a.logger.Warn("k8s_ingress: ensure WAF configmap failed",
+			zap.String("ingress", key),
+			zap.Error(err),
+		)
+	} else if cmName != "" {
+		if ing.Annotations == nil {
+			ing.Annotations = make(map[string]string)
+		}
+		ing.Annotations[annotationWAFRulesConfigMap] = cmName
+	}
+
 	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
 
 	// Load TLS cert from spec.tls when the handler is cert-manager (or unset
