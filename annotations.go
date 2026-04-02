@@ -2,6 +2,7 @@ package k8singress
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -236,6 +237,27 @@ const (
 
 	// WWW-Authenticate realm string. Default: "Restricted"
 	annotationBasicAuthRealm = "caddy.ingress/basic-auth-realm"
+
+	// ── Authorization policy ──────────────────────────────────────────────────────
+
+	// Name of a ConfigMap (same namespace as the Ingress) whose "handler" key
+	// contains raw Caddy handler JSON to inject into the route, after the WAF
+	// and before the reverse_proxy. Intended for caddy-security authorization
+	// policies, but accepts any valid Caddy handler JSON.
+	//
+	// Example ConfigMap:
+	//   apiVersion: v1
+	//   kind: ConfigMap
+	//   metadata:
+	//     name: myapp-auth-policy
+	//   data:
+	//     handler: |
+	//       {
+	//         "handler": "authorize",
+	//         "context": "default",
+	//         "primary": "myapp-users"
+	//       }
+	annotationAuthPolicy = "caddy.ingress/auth-policy"
 )
 
 // headerConfig holds parsed header set/delete instructions from annotations.
@@ -315,6 +337,10 @@ type ingressAnnotations struct {
 	wafDirectives []string
 	proxy             proxyConfig
 	basicAuth         *basicAuthConfig
+	// authPolicyHandler is a raw Caddy handler (unmarshaled from ConfigMap JSON)
+	// injected into the route after the WAF and before the reverse_proxy.
+	// nil when no caddy.ingress/auth-policy annotation is present.
+	authPolicyHandler interface{}
 }
 
 // proxyConfig holds upstream connection/timeout/body settings.
@@ -610,6 +636,21 @@ func resolveAnnotations(ctx context.Context, client kubernetes.Interface, ing *n
 	out.tlsCA = strings.TrimSpace(a[annotationTLSCA])
 	out.tlsCASecret = strings.TrimSpace(a[annotationTLSCASecret])
 
+	// ── Authorization policy ──────────────────────────────────────────────────────
+
+	if cmName := strings.TrimSpace(a[annotationAuthPolicy]); cmName != "" {
+		handler, err := fetchAuthPolicyHandler(ctx, client, ing.Namespace, cmName)
+		if err != nil {
+			log.Warn("k8s_ingress: auth-policy configmap fetch failed — route will have no authorization handler",
+				zap.String("ingress", ing.Namespace+"/"+ing.Name),
+				zap.String("configmap", cmName),
+				zap.Error(err),
+			)
+		} else {
+			out.authPolicyHandler = handler
+		}
+	}
+
 	// ── Basic auth ───────────────────────────────────────────────────────────────
 
 	if secretName := a[annotationBasicAuthSecret]; secretName != "" {
@@ -689,6 +730,27 @@ func parseBodySize(s string) (int64, error) {
 		return 0, fmt.Errorf("parse %q: %w", s, err)
 	}
 	return n * multiplier, nil
+}
+
+// fetchAuthPolicyHandler reads a ConfigMap and returns the unmarshaled Caddy
+// handler from its "handler" key. The value must be valid JSON representing a
+// single Caddy handler object (e.g. the caddy-security "authorize" handler).
+func fetchAuthPolicyHandler(ctx context.Context, client kubernetes.Interface, namespace, cmName string) (interface{}, error) {
+	cm, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, cmName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get configmap %s/%s: %w", namespace, cmName, err)
+	}
+
+	raw, ok := cm.Data["handler"]
+	if !ok {
+		return nil, fmt.Errorf("configmap %s/%s has no 'handler' key", namespace, cmName)
+	}
+
+	var h interface{}
+	if err := json.Unmarshal([]byte(raw), &h); err != nil {
+		return nil, fmt.Errorf("configmap %s/%s: invalid JSON in 'handler' key: %w", namespace, cmName, err)
+	}
+	return h, nil
 }
 
 // fetchWAFDirectives reads a ConfigMap and returns the lines from its

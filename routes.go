@@ -191,7 +191,8 @@ func convertPath(path string, pt *networkingv1.PathType) []string {
 //  6. URI rewrite
 //  7. Security headers
 //  8. Coraza WAF
-//  9. reverse_proxy
+//  9. Authorization policy         (caddy-security or any custom handler)
+// 10. reverse_proxy
 func buildHandlers(upstream string, sec SecurityConfig, ann ingressAnnotations, plainHTTP bool) []interface{} {
 	// Redirect annotations replace the entire handler chain.
 	if ann.permanentRedirect != "" || ann.temporalRedirect != "" {
@@ -298,6 +299,10 @@ func buildCoreHandlers(upstream string, sec SecurityConfig, ann ingressAnnotatio
 	}
 	if wafEnabled {
 		handlers = append(handlers, wafHandler(wafMode, ann.wafDirectives))
+	}
+
+	if ann.authPolicyHandler != nil {
+		handlers = append(handlers, ann.authPolicyHandler)
 	}
 
 	handlers = append(handlers, reverseProxyHandler(upstream, sec.InjectRealIP, ann.proxy, plainHTTP, ann.requestHeaders))
