@@ -28,6 +28,11 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
   xcaddy:
     runs-on: ubuntu-latest
     steps:
