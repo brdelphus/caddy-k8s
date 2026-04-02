@@ -294,8 +294,9 @@ All annotations use the `caddy.ingress/` prefix and are set per Ingress resource
 | `caddy.ingress/whitelist-source-range` | — | Comma-separated CIDRs to allow; all others get 403 |
 | `caddy.ingress/blocklist-source-range` | — | Comma-separated CIDRs to deny; all others pass |
 | `caddy.ingress/limit-rps` | — | Max requests/second per client IP (uses caddy-ratelimit) |
-| `caddy.ingress/basic-auth-secret` | — | Secret name (same namespace) with `auth` htpasswd key |
+| `caddy.ingress/basic-auth-secret` | — | Secret name (same namespace) with `auth` htpasswd key (bcrypt only) |
 | `caddy.ingress/basic-auth-realm` | `Restricted` | WWW-Authenticate realm string |
+| `caddy.ingress/auth-policy` | — | ConfigMap name (same namespace) whose `handler` key contains raw Caddy handler JSON injected after WAF and before `reverse_proxy` |
 
 ---
 
@@ -600,6 +601,37 @@ htpasswd -cbB auth.htpasswd alice password1
 htpasswd -bB  auth.htpasswd bob   password2
 kubectl create secret generic my-app-basic-auth --from-file=auth=auth.htpasswd
 ```
+
+### Authorization policy (caddy-security)
+
+Protect a route with a caddy-security authorization policy — or any custom Caddy handler — without editing the Caddyfile. Create a ConfigMap whose `handler` key contains raw Caddy handler JSON, then reference it via the `caddy.ingress/auth-policy` annotation.
+
+The handler is injected **after the WAF** and **before `reverse_proxy`** in the handler chain.
+
+```yaml
+# 1. Create the policy ConfigMap in the same namespace as the Ingress
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: myapp-auth-policy
+  namespace: myapp
+data:
+  handler: |
+    {
+      "handler": "authorize",
+      "context": "default",
+      "primary": "users"
+    }
+```
+
+```yaml
+# 2. Reference it on the Ingress
+metadata:
+  annotations:
+    caddy.ingress/auth-policy: myapp-auth-policy
+```
+
+The `"primary"` value must match a policy name configured in `caddy-security`'s global options block (`plugins.security.policies` in the Helm chart). If the ConfigMap is missing or the `handler` key contains invalid JSON, caddy-k8s logs a warning and the route is created **without** the authorization handler.
 
 ---
 
