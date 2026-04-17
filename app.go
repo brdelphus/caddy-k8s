@@ -7,10 +7,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/client-go/informers"
@@ -96,7 +98,13 @@ func (*App) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets defaults and initialises the route store.
+// Provision sets defaults, initialises the route store, and resolves Caddy
+// HTTP server names via the in-process Go API.
+//
+// Server name resolution happens here — NOT in Start() — because Start() is
+// called while Caddy holds the config write-lock. Any GET /config/... admin
+// API call from Start() waits for the read-lock → deadlock. Using ctx.App()
+// accesses the already-provisioned HTTP app directly, with no HTTP round-trip.
 func (a *App) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
 	if a.IngressClass == "" {
@@ -130,6 +138,42 @@ func (a *App) Provision(ctx caddy.Context) error {
 		a.store = newMemoryStore()
 	}
 
+	// Discover server names from the HTTP app if not explicitly configured.
+	// ctx.App("http") provisions (if needed) and returns the caddyhttp.App
+	// with Servers already populated from the Caddyfile JSON — no HTTP call.
+	if a.ServerName == "" || a.HTTPServerName == "" {
+		if httpAppIface, err := ctx.App("http"); err == nil {
+			httpApp := httpAppIface.(*caddyhttp.App)
+			for name, srv := range httpApp.Servers {
+				for _, addr := range srv.Listen {
+					if a.serverName == "" && strings.HasSuffix(addr, ":443") {
+						a.serverName = name
+					}
+					if a.httpServerName == "" && strings.HasSuffix(addr, ":80") {
+						a.httpServerName = name
+					}
+				}
+			}
+		} else {
+			a.logger.Warn("k8s_ingress: could not access HTTP app for server discovery; will retry in Start()",
+				zap.Error(err))
+		}
+	}
+	// Explicit config values override auto-discovery.
+	if a.ServerName != "" {
+		a.serverName = a.ServerName
+	}
+	if a.HTTPServerName != "" {
+		a.httpServerName = a.HTTPServerName
+	}
+
+	if a.serverName != "" || a.httpServerName != "" {
+		a.logger.Info("k8s_ingress: resolved server names",
+			zap.String("https_server", a.serverName),
+			zap.String("http_server", a.httpServerName),
+		)
+	}
+
 	return nil
 }
 
@@ -138,8 +182,12 @@ func (a *App) Provision(ctx caddy.Context) error {
 // NOTE: Start() is invoked by Caddy while holding the config write-lock.
 // Any call to the admin API from within Start() will deadlock because
 // GET /config/... waits for the read-lock which is blocked by the write-lock.
-// We therefore return immediately and run the real startup in a goroutine
-// that executes after Caddy releases the lock.
+// Server names were resolved in Provision() via ctx.App("http") — no admin
+// API call needed here. The informer is still run asynchronously to avoid
+// blocking Caddy startup on the initial k8s list/watch network round-trip.
+// If server names were not discoverable at Provision time, run() falls back
+// to polling the admin API (which is safe from a goroutine since Caddy has
+// released the config write-lock by then).
 func (a *App) Start() error {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -164,43 +212,45 @@ func (a *App) Start() error {
 	return nil
 }
 
-// run is the real startup logic, executed asynchronously so that Start()
-// can return before Caddy releases the config write-lock (avoiding a deadlock
-// when resolveServerName calls GET /config/apps/http/servers).
+// run executes the full informer startup after Start() has returned and Caddy
+// has released the config write-lock.
 func (a *App) run(client kubernetes.Interface) {
-	adm := newAdminClient(a.AdminAPI)
-
-	// Resolve HTTPS server name — retry until the admin API is ready.
-	var serverName string
-	for {
+	// If Provision() could not discover server names (e.g. HTTP app not
+	// configured yet), fall back to polling the admin API with retries.
+	// This is safe here because Caddy has released the write-lock by now.
+	if a.serverName == "" {
+		adm := newAdminClient(a.AdminAPI)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			name, err := resolveServerName(ctx, adm, a.ServerName, ":443")
+			cancel()
+			if err == nil {
+				a.mu.Lock()
+				a.serverName = name
+				a.mu.Unlock()
+				break
+			}
+			a.logger.Warn("k8s_ingress: waiting for HTTPS server (will retry)", zap.Error(err))
+			select {
+			case <-a.stopCh:
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+	if a.httpServerName == "" {
+		adm := newAdminClient(a.AdminAPI)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		name, err := resolveServerName(ctx, adm, a.ServerName, ":443")
+		httpName, err := resolveServerName(ctx, adm, a.HTTPServerName, ":80")
 		cancel()
-		if err == nil {
-			serverName = name
-			break
-		}
-		a.logger.Warn("k8s_ingress: waiting for HTTPS server (will retry)", zap.Error(err))
-		select {
-		case <-a.stopCh:
-			return
-		case <-time.After(2 * time.Second):
+		if err != nil {
+			a.logger.Warn("k8s_ingress: HTTP server not found, ssl-redirect will be skipped", zap.Error(err))
+		} else {
+			a.mu.Lock()
+			a.httpServerName = httpName
+			a.mu.Unlock()
 		}
 	}
-	a.mu.Lock()
-	a.serverName = serverName
-	a.mu.Unlock()
-
-	// Resolve HTTP server name (non-fatal).
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	httpName, err := resolveServerName(ctx, adm, a.HTTPServerName, ":80")
-	cancel()
-	if err != nil {
-		a.logger.Warn("k8s_ingress: HTTP server not found, ssl-redirect will be skipped", zap.Error(err))
-	}
-	a.mu.Lock()
-	a.httpServerName = httpName
-	a.mu.Unlock()
 
 	// Restore persisted route ownership from the store so we can clean up
 	// routes belonging to Ingresses that were deleted while Caddy was down.
