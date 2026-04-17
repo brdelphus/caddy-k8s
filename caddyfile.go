@@ -61,6 +61,12 @@ func (a *App) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				a.ServerName = d.Val()
 
+			case "http_server_name":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				a.HTTPServerName = d.Val()
+
 			case "admin_api":
 				if !d.NextArg() {
 					return d.ArgErr()
