@@ -42,12 +42,14 @@ func newAccessLogManager(serverName, httpServerName, adminAPI string, logger *za
 func (m *accessLogManager) Enable(ctx context.Context) error {
 	adm := newAdminClient(m.adminAPI)
 
-	// Register a named "access" logger. No "include" filter — entries reach it
-	// only via the per-server default_logger_name set below, so each request
-	// is logged exactly once regardless of how many servers are configured.
+	// Register a named "access" logger that captures only HTTP access entries.
+	// The include filter is required: without it, both this logger AND Caddy's
+	// default global logger write the same http.log.access.* entries, producing
+	// duplicates. The default logger is told to exclude the same namespace below.
 	loggerPayload := map[string]interface{}{
 		"writer":  map[string]interface{}{"output": "stderr"},
 		"encoder": map[string]interface{}{"format": "json"},
+		"include": []string{"http.log.access"},
 	}
 	body, err := json.Marshal(loggerPayload)
 	if err != nil {
@@ -55,6 +57,19 @@ func (m *accessLogManager) Enable(ctx context.Context) error {
 	}
 	if err := adm.putOrPatch(ctx, "/config/logging/logs/access", body); err != nil {
 		return fmt.Errorf("configure access logger: %w", err)
+	}
+
+	// Tell the default global logger to skip http.log.access entries so they
+	// are not written a second time by the catch-all default logger.
+	defaultExclPayload := map[string]interface{}{
+		"exclude": []string{"http.log.access"},
+	}
+	body, err = json.Marshal(defaultExclPayload)
+	if err != nil {
+		return fmt.Errorf("marshal default logger exclude: %w", err)
+	}
+	if err := adm.putOrPatch(ctx, "/config/logging/logs/default", body); err != nil {
+		return fmt.Errorf("configure default logger exclude: %w", err)
 	}
 
 	// Point both HTTP and HTTPS servers at the "access" logger.
