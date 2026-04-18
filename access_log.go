@@ -25,6 +25,10 @@ type accessLogManager struct {
 	// disabled maps ingress key (namespace/name) to the hosts it contributes
 	// to skip_hosts.
 	disabled map[string][]string
+	// lastSkip is the sorted skip_hosts slice sent in the last successful
+	// rebuild(). Used to skip no-op PATCHes that would trigger Caddy's
+	// "config is unchanged" log noise.
+	lastSkip string // JSON-encoded for easy comparison
 }
 
 func newAccessLogManager(serverName, httpServerName, adminAPI string, logger *zap.Logger) *accessLogManager {
@@ -146,6 +150,16 @@ func (m *accessLogManager) rebuild(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("marshal skip_hosts: %w", err)
 	}
+
+	// Skip the PATCH if the list hasn't changed — avoids Caddy logging
+	// "config is unchanged" on every periodic ingress re-sync.
+	m.mu.Lock()
+	unchanged := m.lastSkip == string(body)
+	m.mu.Unlock()
+	if unchanged {
+		return nil
+	}
+
 	adm := newAdminClient(m.adminAPI)
 	// PATCH replaces an existing value; Enable() always initialises skip_hosts
 	// so it is guaranteed to exist by the time rebuild() is called.
@@ -155,5 +169,9 @@ func (m *accessLogManager) rebuild(ctx context.Context) error {
 			return fmt.Errorf("update skip_hosts (%s): %w", srv, err)
 		}
 	}
+
+	m.mu.Lock()
+	m.lastSkip = string(body)
+	m.mu.Unlock()
 	return nil
 }

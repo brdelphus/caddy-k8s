@@ -5,6 +5,7 @@ package k8singress
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -61,6 +62,12 @@ type App struct {
 	// can suppress logging via the caddy.ingress/access-log: "false" annotation.
 	AccessLog bool `json:"access_log,omitempty"`
 
+	// VerboseLogs controls whether per-ingress sync events and admin API
+	// request logs are emitted at Info level. When false (default), sync
+	// messages are demoted to Debug and the admin.api logger is set to WARN,
+	// keeping the log stream clean in production. Set to true for debugging.
+	VerboseLogs bool `json:"verbose_logs,omitempty"`
+
 	logger         *zap.Logger
 	client         kubernetes.Interface
 	stopCh         chan struct{}
@@ -95,6 +102,15 @@ type SecurityConfig struct {
 	// InjectRealIP adds X-Real-IP and X-Forwarded-Proto headers to upstream
 	// requests — required by Mailu and nginx-based backends.
 	InjectRealIP bool `json:"inject_real_ip,omitempty"`
+}
+
+// syncLog emits a sync-related log at Info when VerboseLogs is true, Debug otherwise.
+func (a *App) syncLog(msg string, fields ...zap.Field) {
+	if a.VerboseLogs {
+		a.logger.Info(msg, fields...)
+	} else {
+		a.logger.Debug(msg, fields...)
+	}
 }
 
 // CaddyModule returns the Caddy module info.
@@ -289,6 +305,18 @@ func (a *App) run(client kubernetes.Interface) {
 		}
 	}
 
+	// Suppress admin API request logs (INFO "received request") when not in
+	// verbose mode. Sets the admin.api named logger to WARN so errors still
+	// surface while the per-request noise disappears.
+	if !a.VerboseLogs {
+		adm := newAdminClient(a.AdminAPI)
+		payload := map[string]interface{}{"level": "WARN"}
+		body, _ := json.Marshal(payload)
+		if err := adm.putOrPatch(context.Background(), "/config/logging/logs/admin.api", body); err != nil {
+			a.logger.Warn("k8s_ingress: could not suppress admin.api logs", zap.Error(err))
+		}
+	}
+
 	a.logger.Info("k8s_ingress: watching ingresses",
 		zap.String("class", a.IngressClass),
 		zap.String("https_server", a.serverName),
@@ -350,7 +378,7 @@ func (a *App) handleAdd(obj interface{}) {
 	for _, rule := range ing.Spec.Rules {
 		hosts = append(hosts, rule.Host)
 	}
-	a.logger.Info("k8s_ingress: syncing ingress",
+	a.syncLog("k8s_ingress: syncing ingress",
 		zap.String("ingress", key),
 		zap.Strings("hosts", hosts),
 		zap.String("class", a.IngressClass),
@@ -378,7 +406,7 @@ func (a *App) handleAdd(obj interface{}) {
 	ann := resolveAnnotations(ctx, a.client, ing, a.logger)
 
 	if fields := ann.annotationFields(); len(fields) > 0 {
-		a.logger.Info("k8s_ingress: ingress annotations",
+		a.syncLog("k8s_ingress: ingress annotations",
 			append([]zap.Field{zap.String("ingress", key)}, fields...)...)
 	}
 
@@ -477,7 +505,7 @@ func (a *App) handleAdd(obj interface{}) {
 		a.logger.Warn("k8s_ingress: store save", zap.String("ingress", key), zap.Error(err))
 	}
 
-	a.logger.Info("k8s_ingress: synced ingress", zap.String("ingress", key), zap.Int("routes", len(routes)))
+	a.syncLog("k8s_ingress: synced ingress", zap.String("ingress", key), zap.Int("routes", len(routes)))
 }
 
 func (a *App) handleDelete(obj interface{}) {
