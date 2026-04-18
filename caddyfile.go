@@ -89,6 +89,12 @@ func (a *App) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				a.AccessLog = d.Val() == "on"
 
+			case "verbose_logs":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				a.VerboseLogs = d.Val() == "on"
+
 			default:
 				return d.Errf("unknown k8s_ingress option: %s", d.Val())
 			}
