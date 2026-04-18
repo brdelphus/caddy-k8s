@@ -37,7 +37,12 @@ func (c *adminClient) upsertRoute(ctx context.Context, serverName string, r cadd
 	}
 
 	if exists {
-		return c.do(ctx, http.MethodPut, "/id/"+r.ID, body)
+		// PUT /id/<id> fails when the body carries @id: Caddy momentarily indexes
+		// both the old and new entries before removing the old one, triggering a
+		// duplicate-@id validation error. Delete then re-post instead.
+		if err := c.do(ctx, http.MethodDelete, "/id/"+r.ID, nil); err != nil {
+			return fmt.Errorf("delete before update: %w", err)
+		}
 	}
 	return c.do(ctx, http.MethodPost,
 		fmt.Sprintf("/config/apps/http/servers/%s/routes/", serverName),

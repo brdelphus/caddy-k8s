@@ -533,8 +533,8 @@ func reverseProxyHandler(upstream string, injectRealIP bool, proxy proxyConfig, 
 		if plainHTTP {
 			proto, port = "http", "80"
 		}
-		reqHeaders["X-Real-IP"] = []string{"{client_ip}"}
-		reqHeaders["X-Forwarded-For"] = []string{"{client_ip}"}
+		reqHeaders["X-Real-IP"] = []string{"{http.vars.client_ip}"}
+		reqHeaders["X-Forwarded-For"] = []string{"{http.vars.client_ip}"}
 		reqHeaders["X-Forwarded-Proto"] = []string{proto}
 		reqHeaders["X-Forwarded-Host"] = []string{"{http.request.host}"}
 		reqHeaders["X-Forwarded-Port"] = []string{port}
