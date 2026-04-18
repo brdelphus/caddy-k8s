@@ -50,7 +50,7 @@ func (m *accessLogManager) Enable(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("marshal access logger: %w", err)
 	}
-	if err := adm.do(ctx, "PUT", "/config/logging/logs/access", body); err != nil {
+	if err := adm.putOrPatch(ctx, "/config/logging/logs/access", body); err != nil {
 		return fmt.Errorf("configure access logger: %w", err)
 	}
 
@@ -65,7 +65,7 @@ func (m *accessLogManager) Enable(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("marshal server logs config: %w", err)
 	}
-	if err := adm.do(ctx, "PUT",
+	if err := adm.putOrPatch(ctx,
 		fmt.Sprintf("/config/apps/http/servers/%s/logs", m.serverName), body); err != nil {
 		return fmt.Errorf("configure server logs: %w", err)
 	}

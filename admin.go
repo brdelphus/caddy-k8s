@@ -238,6 +238,17 @@ func (c *adminClient) deleteTLSPolicy(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/id/"+id, nil)
 }
 
+// putOrPatch tries PUT; on 409 (key already exists) retries with PATCH.
+// Use this for idempotent writes to paths that may already exist after a
+// module restart.
+func (c *adminClient) putOrPatch(ctx context.Context, path string, body []byte) error {
+	err := c.do(ctx, http.MethodPut, path, body)
+	if err != nil && strings.Contains(err.Error(), "status 409") {
+		return c.do(ctx, http.MethodPatch, path, body)
+	}
+	return err
+}
+
 // postJSON sends a JSON payload to the given path via POST.
 func (c *adminClient) postJSON(ctx context.Context, path string, payload interface{}) error {
 	body, err := json.Marshal(payload)
