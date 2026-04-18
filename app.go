@@ -64,11 +64,14 @@ type App struct {
 	logger         *zap.Logger
 	client         kubernetes.Interface
 	stopCh         chan struct{}
+	// ctx is cancelled in Stop() so that in-flight admin API calls made by
+	// this module instance are aborted before the new instance takes over.
+	// Without this, old and new instances race on the same ingress during a
+	// config reload and produce duplicate-@id errors.
+	ctx            context.Context
+	ctxCancel      context.CancelFunc
 	mu             sync.Mutex
-	// keyMu serialises handleAdd/handleDelete per ingress key so that two
-	// overlapping module instances (old + new during a config reload) cannot
-	// race on the same ingress and produce duplicate routes.
-	keyMu          sync.Map // map[string]*sync.Mutex
+	keyMu          sync.Map // map[string]*sync.Mutex — serialises per ingress key
 	store          routeStore
 	// routeIDs is an in-process cache of store contents for fast lookups.
 	routeIDs        map[string][]string
@@ -193,6 +196,8 @@ func (a *App) Provision(ctx caddy.Context) error {
 // to polling the admin API (which is safe from a goroutine since Caddy has
 // released the config write-lock by then).
 func (a *App) Start() error {
+	a.ctx, a.ctxCancel = context.WithCancel(context.Background())
+
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		// Fall back to kubeconfig for local development / testing.
@@ -308,6 +313,11 @@ func (a *App) run(client kubernetes.Interface) {
 
 // Stop shuts down the informer and closes the store connection.
 func (a *App) Stop() error {
+	// Cancel the module context first so any in-flight admin API calls in
+	// handleAdd/handleDelete are aborted before the new module instance starts.
+	if a.ctxCancel != nil {
+		a.ctxCancel()
+	}
 	close(a.stopCh)
 	if a.tlsManager != nil {
 		a.tlsManager.Stop()
@@ -336,13 +346,24 @@ func (a *App) handleAdd(obj interface{}) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	var hosts []string
+	for _, rule := range ing.Spec.Rules {
+		hosts = append(hosts, rule.Host)
+	}
+	a.logger.Info("k8s_ingress: syncing ingress",
+		zap.String("ingress", key),
+		zap.Strings("hosts", hosts),
+		zap.String("class", a.IngressClass),
+	)
+
+	ctx := a.ctx
 	adm := newAdminClient(a.AdminAPI)
 
 	// When WAF is enabled and no waf-rules-configmap annotation is set yet,
 	// create the ConfigMap with default directives and patch the Ingress.
 	// Inject the CM name into the local Ingress copy so resolveAnnotations
 	// picks it up in this same sync cycle without waiting for the next event.
-	if cmName, err := a.ensureWAFConfigMap(context.Background(), ing); err != nil {
+	if cmName, err := a.ensureWAFConfigMap(ctx, ing); err != nil {
 		a.logger.Warn("k8s_ingress: ensure WAF configmap failed",
 			zap.String("ingress", key),
 			zap.Error(err),
@@ -354,7 +375,7 @@ func (a *App) handleAdd(obj interface{}) {
 		ing.Annotations[annotationWAFRulesConfigMap] = cmName
 	}
 
-	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
+	ann := resolveAnnotations(ctx, a.client, ing, a.logger)
 
 	if fields := ann.annotationFields(); len(fields) > 0 {
 		a.logger.Info("k8s_ingress: ingress annotations",
@@ -365,7 +386,7 @@ func (a *App) handleAdd(obj interface{}) {
 	// with a secretName present — backwards compatibility).
 	// CertMagic manages its own certs; no loading needed.
 	if len(ing.Spec.TLS) > 0 && ann.tlsHandler != "certmagic" {
-		if err := a.tlsManager.LoadFromIngress(context.Background(), ing); err != nil {
+		if err := a.tlsManager.LoadFromIngress(ctx, ing); err != nil {
 			a.logger.Error("k8s_ingress: failed to load TLS from ingress",
 				zap.String("ingress", key),
 				zap.Error(err),
@@ -377,11 +398,11 @@ func (a *App) handleAdd(obj interface{}) {
 	if a.accessLogMgr != nil {
 		hosts := ingressHosts(ing)
 		if ann.accessLogDisabled && len(hosts) > 0 {
-			if err := a.accessLogMgr.Skip(context.Background(), key, hosts); err != nil {
+			if err := a.accessLogMgr.Skip(ctx, key, hosts); err != nil {
 				a.logger.Warn("k8s_ingress: skip access log", zap.String("ingress", key), zap.Error(err))
 			}
 		} else {
-			if err := a.accessLogMgr.Unskip(context.Background(), key); err != nil {
+			if err := a.accessLogMgr.Unskip(ctx, key); err != nil {
 				a.logger.Warn("k8s_ingress: unskip access log", zap.String("ingress", key), zap.Error(err))
 			}
 		}
@@ -391,7 +412,7 @@ func (a *App) handleAdd(obj interface{}) {
 	// CA is requested. Plain certmagic (no extra annotations) falls through to
 	// the global automation policy configured in the Caddyfile.
 	if len(ing.Spec.TLS) > 0 && ann.tlsHandler == "certmagic" && (ann.tlsOnDemand || ann.tlsCA != "") {
-		if err := a.tlsPolicyMgr.Sync(context.Background(), ing, ann); err != nil {
+		if err := a.tlsPolicyMgr.Sync(ctx, ing, ann); err != nil {
 			a.logger.Error("k8s_ingress: failed to sync TLS automation policy",
 				zap.String("ingress", key),
 				zap.Error(err),
@@ -403,7 +424,7 @@ func (a *App) handleAdd(obj interface{}) {
 	// ssl-redirect: also inject HTTP→HTTPS redirect routes on the HTTP server.
 	if ann.sslRedirect && a.httpServerName != "" {
 		for _, r := range httpRedirectRoutes(ing) {
-			if err := adm.upsertRoute(context.Background(), a.httpServerName, r); err != nil {
+			if err := adm.upsertRoute(ctx, a.httpServerName, r); err != nil {
 				a.logger.Warn("k8s_ingress: upsert ssl-redirect route",
 					zap.String("id", r.ID), zap.Error(err))
 			}
@@ -424,7 +445,7 @@ func (a *App) handleAdd(obj interface{}) {
 	newSet := stringSet(newIDs)
 	for id := range oldSet {
 		if !newSet[id] {
-			if err := adm.deleteRoute(context.Background(), id); err != nil {
+			if err := adm.deleteRoute(ctx, id); err != nil {
 				a.logger.Warn("k8s_ingress: delete stale route", zap.String("id", id), zap.Error(err))
 			}
 		}
@@ -443,7 +464,7 @@ func (a *App) handleAdd(obj interface{}) {
 
 	// Upsert each route.
 	for _, r := range routes {
-		if err := adm.upsertRoute(context.Background(), targetServer, r); err != nil {
+		if err := adm.upsertRoute(ctx, targetServer, r); err != nil {
 			a.logger.Error("k8s_ingress: upsert route", zap.String("id", r.ID), zap.Error(err))
 		}
 	}
@@ -452,7 +473,7 @@ func (a *App) handleAdd(obj interface{}) {
 	a.routeIDs[key] = newIDs
 	a.mu.Unlock()
 
-	if err := a.store.save(context.Background(), key, newIDs); err != nil {
+	if err := a.store.save(ctx, key, newIDs); err != nil {
 		a.logger.Warn("k8s_ingress: store save", zap.String("ingress", key), zap.Error(err))
 	}
 
@@ -470,17 +491,19 @@ func (a *App) handleDelete(obj interface{}) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	ctx := a.ctx
+
 	// Clean up TLS certificates and automation policies.
 	if len(ing.Spec.TLS) > 0 {
 		a.tlsManager.RemoveFromIngress(ing)
-		if err := a.tlsPolicyMgr.Remove(context.Background(), ing); err != nil {
+		if err := a.tlsPolicyMgr.Remove(ctx, ing); err != nil {
 			a.logger.Warn("k8s_ingress: remove TLS policy", zap.String("ingress", key), zap.Error(err))
 		}
 	}
 
 	// Remove access log suppression for deleted Ingress.
 	if a.accessLogMgr != nil {
-		if err := a.accessLogMgr.Unskip(context.Background(), key); err != nil {
+		if err := a.accessLogMgr.Unskip(ctx, key); err != nil {
 			a.logger.Warn("k8s_ingress: unskip access log on delete", zap.String("ingress", key), zap.Error(err))
 		}
 	}
@@ -493,12 +516,12 @@ func (a *App) handleDelete(obj interface{}) {
 	a.mu.Unlock()
 
 	for _, id := range ids {
-		if err := adm.deleteRoute(context.Background(), id); err != nil {
+		if err := adm.deleteRoute(ctx, id); err != nil {
 			a.logger.Warn("k8s_ingress: delete route", zap.String("id", id), zap.Error(err))
 		}
 	}
 
-	if err := a.store.remove(context.Background(), key); err != nil {
+	if err := a.store.remove(ctx, key); err != nil {
 		a.logger.Warn("k8s_ingress: store remove", zap.String("ingress", key), zap.Error(err))
 	}
 
