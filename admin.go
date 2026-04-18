@@ -24,10 +24,13 @@ func newAdminClient(addr string) *adminClient {
 	}
 }
 
-// upsertRoute checks if a route with the given @id exists and either updates
-// it (DELETE+POST) or appends it to the server's route list (POST /config/…).
-// Retries up to 3 times with backoff to survive the brief admin API restart
-// window that follows an in-place Caddy config reload.
+// upsertRoute checks if a route with the given @id exists in Caddy's live
+// config. If it does and its content is already identical to r, it returns
+// immediately (no-op) — this breaks the infinite-reload loop that would
+// otherwise occur because every admin API mutation triggers a Caddy config
+// reload which restarts k8s_ingress, which would sync again, mutate again, etc.
+// If the route is absent or stale, it uses DELETE+POST (avoiding Caddy's PUT
+// duplicate-@id bug). Retries up to 3 times with backoff.
 func (c *adminClient) upsertRoute(ctx context.Context, serverName string, r caddyRoute) error {
 	body, err := json.Marshal(r)
 	if err != nil {
@@ -44,13 +47,21 @@ func (c *adminClient) upsertRoute(ctx context.Context, serverName string, r cadd
 			}
 		}
 
-		exists, err := c.routeExists(ctx, r.ID)
+		current, err := c.getRoute(ctx, r.ID)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
-		if exists {
+		if current != nil {
+			// Normalise both sides to comparable JSON so field-ordering differences
+			// between our marshaller and Caddy's don't trigger spurious updates.
+			currentNorm, err1 := normaliseJSON(current)
+			desiredNorm, err2 := normaliseJSON(body)
+			if err1 == nil && err2 == nil && currentNorm == desiredNorm {
+				return nil // already up-to-date, no mutation needed
+			}
+			// Route exists but content differs — replace it.
 			// PUT /id/<id> fails when the body carries @id: Caddy momentarily indexes
 			// both the old and new entries before removing the old one, triggering a
 			// duplicate-@id validation error. Delete then re-post instead.
@@ -72,10 +83,44 @@ func (c *adminClient) upsertRoute(ctx context.Context, serverName string, r cadd
 	return lastErr
 }
 
+// getRoute fetches the current route JSON for the given @id. Returns nil, nil
+// if the route does not exist.
+func (c *adminClient) getRoute(ctx context.Context, id string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/id/"+id, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET /id/%s: status %d", id, resp.StatusCode)
+	}
+	return b, nil
+}
+
+// normaliseJSON round-trips JSON through interface{} so the output has
+// consistent key ordering (Go's map iteration is random, but json.Marshal
+// sorts map keys alphabetically since Go 1.12 via reflect).
+func normaliseJSON(b []byte) (string, error) {
+	var v interface{}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return "", err
+	}
+	out, err := json.Marshal(v)
+	return string(out), err
+}
+
 // deleteRoute removes a route by its @id. Returns nil if the route doesn't exist.
 func (c *adminClient) deleteRoute(ctx context.Context, id string) error {
-	exists, err := c.routeExists(ctx, id)
-	if err != nil || !exists {
+	b, err := c.getRoute(ctx, id)
+	if err != nil || b == nil {
 		return err
 	}
 	return c.do(ctx, http.MethodDelete, "/id/"+id, nil)
