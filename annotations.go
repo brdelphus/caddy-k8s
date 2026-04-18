@@ -819,3 +819,103 @@ func fetchBasicAuthAccounts(ctx context.Context, client kubernetes.Interface, na
 	}
 	return accounts, nil
 }
+
+// annotationFields returns a slice of zap fields describing the active
+// (non-default) annotations on ann. Used for structured log output.
+func (ann ingressAnnotations) annotationFields() []zap.Field {
+	var f []zap.Field
+	if len(ann.whitelist) > 0 {
+		f = append(f, zap.Strings("whitelist", ann.whitelist))
+	}
+	if len(ann.blocklist) > 0 {
+		f = append(f, zap.Strings("blocklist", ann.blocklist))
+	}
+	if ann.sslRedirect {
+		f = append(f, zap.Bool("ssl-redirect", true))
+	}
+	if ann.permanentRedirect != "" {
+		f = append(f, zap.String("permanent-redirect", ann.permanentRedirect))
+	}
+	if ann.temporalRedirect != "" {
+		f = append(f, zap.String("temporal-redirect", ann.temporalRedirect))
+	}
+	if ann.rewriteTarget != "" {
+		f = append(f, zap.String("rewrite-target", ann.rewriteTarget))
+	}
+	if len(ann.serverAliases) > 0 {
+		f = append(f, zap.Strings("server-aliases", ann.serverAliases))
+	}
+	if ann.limitRPS > 0 {
+		f = append(f, zap.Int("limit-rps", ann.limitRPS))
+	}
+	if ann.cors != nil {
+		f = append(f, zap.Strings("cors-origins", ann.cors.origins))
+	}
+	if ann.accessLogDisabled {
+		f = append(f, zap.Bool("access-log-disabled", true))
+	}
+	if !ann.requestHeaders.empty() {
+		keys := make([]string, 0, len(ann.requestHeaders.set))
+		for k := range ann.requestHeaders.set {
+			keys = append(keys, k)
+		}
+		keys = append(keys, ann.requestHeaders.delete...)
+		f = append(f, zap.Strings("request-headers", keys))
+	}
+	if !ann.responseHeaders.empty() {
+		keys := make([]string, 0, len(ann.responseHeaders.set))
+		for k := range ann.responseHeaders.set {
+			keys = append(keys, k)
+		}
+		keys = append(keys, ann.responseHeaders.delete...)
+		f = append(f, zap.Strings("response-headers", keys))
+	}
+	if ann.tlsHandler != "" {
+		f = append(f, zap.String("tls", ann.tlsHandler))
+	}
+	if ann.tlsOnDemand {
+		f = append(f, zap.Bool("tls-ondemand", true))
+	}
+	if ann.tlsCA != "" {
+		f = append(f, zap.String("tls-ca", ann.tlsCA))
+	}
+	if ann.wafOverride != nil {
+		mode := ann.wafModeOverride
+		if mode == "" {
+			if *ann.wafOverride {
+				mode = "on"
+			} else {
+				mode = "off"
+			}
+		}
+		f = append(f, zap.String("waf", mode))
+	}
+	if len(ann.wafDirectives) > 0 {
+		f = append(f, zap.Int("waf-extra-directives", len(ann.wafDirectives)))
+	}
+	if ann.proxy.maxBodySize > 0 {
+		f = append(f, zap.Int64("proxy-body-size", ann.proxy.maxBodySize))
+	}
+	if ann.proxy.readTimeout != "" {
+		f = append(f, zap.String("proxy-read-timeout", ann.proxy.readTimeout))
+	}
+	if ann.proxy.connectTimeout != "" {
+		f = append(f, zap.String("proxy-connect-timeout", ann.proxy.connectTimeout))
+	}
+	if ann.proxy.backendTLS {
+		f = append(f, zap.Bool("backend-protocol-https", true))
+	}
+	if ann.proxy.upstreamVhost != "" {
+		f = append(f, zap.String("upstream-vhost", ann.proxy.upstreamVhost))
+	}
+	if ann.proxy.retries > 0 {
+		f = append(f, zap.Int("proxy-retries", ann.proxy.retries))
+	}
+	if ann.basicAuth != nil {
+		f = append(f, zap.String("basic-auth-realm", ann.basicAuth.realm))
+	}
+	if ann.authPolicyHandler != nil {
+		f = append(f, zap.Bool("auth-policy", true))
+	}
+	return f
+}

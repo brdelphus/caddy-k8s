@@ -356,6 +356,11 @@ func (a *App) handleAdd(obj interface{}) {
 
 	ann := resolveAnnotations(context.Background(), a.client, ing, a.logger)
 
+	if fields := ann.annotationFields(); len(fields) > 0 {
+		a.logger.Info("k8s_ingress: ingress annotations",
+			append([]zap.Field{zap.String("ingress", key)}, fields...)...)
+	}
+
 	// Load TLS cert from spec.tls when the handler is cert-manager (or unset
 	// with a secretName present — backwards compatibility).
 	// CertMagic manages its own certs; no loading needed.
