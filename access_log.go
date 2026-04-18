@@ -55,8 +55,11 @@ func (m *accessLogManager) Enable(ctx context.Context) error {
 	}
 
 	// Point the HTTP server at the "access" logger.
+	// Initialize skip_hosts as an empty array so rebuild() can always use
+	// PATCH (update) rather than PUT (create), avoiding 409 on the second call.
 	logsPayload := map[string]interface{}{
 		"default_logger_name": "access",
+		"skip_hosts":          []string{},
 	}
 	body, err = json.Marshal(logsPayload)
 	if err != nil {
@@ -114,7 +117,9 @@ func (m *accessLogManager) rebuild(ctx context.Context) error {
 		return fmt.Errorf("marshal skip_hosts: %w", err)
 	}
 	adm := newAdminClient(m.adminAPI)
-	if err := adm.do(ctx, "PUT",
+	// PATCH replaces an existing value; Enable() always initialises skip_hosts
+	// so it is guaranteed to exist by the time rebuild() is called.
+	if err := adm.do(ctx, "PATCH",
 		fmt.Sprintf("/config/apps/http/servers/%s/logs/skip_hosts", m.serverName), body); err != nil {
 		return fmt.Errorf("update skip_hosts: %w", err)
 	}
