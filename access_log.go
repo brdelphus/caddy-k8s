@@ -17,21 +17,23 @@ import (
 //  2. Sets logs.default_logger_name on the HTTPS server to "access".
 //  3. Maintains a skip_hosts list so individual Ingresses can suppress logging.
 type accessLogManager struct {
-	mu         sync.Mutex
-	serverName string
-	adminAPI   string
-	logger     *zap.Logger
+	mu             sync.Mutex
+	serverName     string // HTTPS server (srv0)
+	httpServerName string // HTTP server (srv1)
+	adminAPI       string
+	logger         *zap.Logger
 	// disabled maps ingress key (namespace/name) to the hosts it contributes
 	// to skip_hosts.
 	disabled map[string][]string
 }
 
-func newAccessLogManager(serverName, adminAPI string, logger *zap.Logger) *accessLogManager {
+func newAccessLogManager(serverName, httpServerName, adminAPI string, logger *zap.Logger) *accessLogManager {
 	return &accessLogManager{
-		serverName: serverName,
-		adminAPI:   adminAPI,
-		logger:     logger,
-		disabled:   make(map[string][]string),
+		serverName:     serverName,
+		httpServerName: httpServerName,
+		adminAPI:       adminAPI,
+		logger:         logger,
+		disabled:       make(map[string][]string),
 	}
 }
 
@@ -54,7 +56,7 @@ func (m *accessLogManager) Enable(ctx context.Context) error {
 		return fmt.Errorf("configure access logger: %w", err)
 	}
 
-	// Point the HTTP server at the "access" logger.
+	// Point both HTTP and HTTPS servers at the "access" logger.
 	// Initialize skip_hosts as an empty array so rebuild() can always use
 	// PATCH (update) rather than PUT (create), avoiding 409 on the second call.
 	logsPayload := map[string]interface{}{
@@ -65,14 +67,26 @@ func (m *accessLogManager) Enable(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("marshal server logs config: %w", err)
 	}
-	if err := adm.putOrPatch(ctx,
-		fmt.Sprintf("/config/apps/http/servers/%s/logs", m.serverName), body); err != nil {
-		return fmt.Errorf("configure server logs: %w", err)
+	for _, srv := range m.servers() {
+		if err := adm.putOrPatch(ctx,
+			fmt.Sprintf("/config/apps/http/servers/%s/logs", srv), body); err != nil {
+			return fmt.Errorf("configure server logs (%s): %w", srv, err)
+		}
 	}
 
 	m.logger.Info("k8s_ingress: access logging enabled",
-		zap.String("server", m.serverName))
+		zap.String("https_server", m.serverName),
+		zap.String("http_server", m.httpServerName))
 	return nil
+}
+
+// servers returns the server names to manage, omitting empty names.
+func (m *accessLogManager) servers() []string {
+	s := []string{m.serverName}
+	if m.httpServerName != "" && m.httpServerName != m.serverName {
+		s = append(s, m.httpServerName)
+	}
+	return s
 }
 
 // Skip adds the given hosts to the skip_hosts list for this Ingress, suppressing
@@ -119,9 +133,11 @@ func (m *accessLogManager) rebuild(ctx context.Context) error {
 	adm := newAdminClient(m.adminAPI)
 	// PATCH replaces an existing value; Enable() always initialises skip_hosts
 	// so it is guaranteed to exist by the time rebuild() is called.
-	if err := adm.do(ctx, "PATCH",
-		fmt.Sprintf("/config/apps/http/servers/%s/logs/skip_hosts", m.serverName), body); err != nil {
-		return fmt.Errorf("update skip_hosts: %w", err)
+	for _, srv := range m.servers() {
+		if err := adm.do(ctx, "PATCH",
+			fmt.Sprintf("/config/apps/http/servers/%s/logs/skip_hosts", srv), body); err != nil {
+			return fmt.Errorf("update skip_hosts (%s): %w", srv, err)
+		}
 	}
 	return nil
 }

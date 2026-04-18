@@ -283,7 +283,7 @@ func (a *App) run(client kubernetes.Interface) {
 
 	// Initialize access log manager and enable server-level access logging.
 	if a.AccessLog {
-		a.accessLogMgr = newAccessLogManager(a.serverName, a.AdminAPI, a.logger)
+		a.accessLogMgr = newAccessLogManager(a.serverName, a.httpServerName, a.AdminAPI, a.logger)
 		if err := a.accessLogMgr.Enable(context.Background()); err != nil {
 			a.logger.Error("k8s_ingress: failed to enable access logging", zap.Error(err))
 		}
