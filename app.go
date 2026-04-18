@@ -65,6 +65,10 @@ type App struct {
 	client         kubernetes.Interface
 	stopCh         chan struct{}
 	mu             sync.Mutex
+	// keyMu serialises handleAdd/handleDelete per ingress key so that two
+	// overlapping module instances (old + new during a config reload) cannot
+	// race on the same ingress and produce duplicate routes.
+	keyMu          sync.Map // map[string]*sync.Mutex
 	store          routeStore
 	// routeIDs is an in-process cache of store contents for fast lookups.
 	routeIDs        map[string][]string
@@ -328,6 +332,10 @@ func (a *App) handleAdd(obj interface{}) {
 	}
 	key := ing.Namespace + "/" + ing.Name
 
+	mu := a.ingressMu(key)
+	mu.Lock()
+	defer mu.Unlock()
+
 	adm := newAdminClient(a.AdminAPI)
 
 	// When WAF is enabled and no waf-rules-configmap annotation is set yet,
@@ -453,6 +461,10 @@ func (a *App) handleDelete(obj interface{}) {
 	}
 	key := ing.Namespace + "/" + ing.Name
 
+	mu := a.ingressMu(key)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Clean up TLS certificates and automation policies.
 	if len(ing.Spec.TLS) > 0 {
 		a.tlsManager.RemoveFromIngress(ing)
@@ -507,6 +519,12 @@ func stringSet(ids []string) map[string]bool {
 		m[id] = true
 	}
 	return m
+}
+
+// ingressMu returns (creating if needed) a per-ingress mutex stored in keyMu.
+func (a *App) ingressMu(key string) *sync.Mutex {
+	v, _ := a.keyMu.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // Interface assertions.
