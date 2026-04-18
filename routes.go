@@ -465,13 +465,13 @@ func wafHandler(mode string, extraDirectives []string) map[string]interface{} {
 	if strings.EqualFold(mode, "On") {
 		ruleEngine = "On"
 	}
-	directives := []string{
+	parts := []string{
 		"Include @coraza.conf-recommended",
 		"Include @crs-setup.conf.example",
 		"Include @owasp_crs/*.conf",
 	}
-	directives = append(directives, extraDirectives...)
-	directives = append(directives,
+	parts = append(parts, extraDirectives...)
+	parts = append(parts,
 		fmt.Sprintf("SecRuleEngine %s", ruleEngine),
 		"SecRequestBodyAccess On",
 		"SecResponseBodyAccess Off",
@@ -480,7 +480,7 @@ func wafHandler(mode string, extraDirectives []string) map[string]interface{} {
 	return map[string]interface{}{
 		"handler":        "waf",
 		"load_owasp_crs": true,
-		"directives":     directives,
+		"directives":     strings.Join(parts, "\n"),
 	}
 }
 

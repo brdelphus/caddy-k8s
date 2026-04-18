@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // adminClient is a minimal Caddy admin API client.
@@ -24,30 +25,51 @@ func newAdminClient(addr string) *adminClient {
 }
 
 // upsertRoute checks if a route with the given @id exists and either updates
-// it (PUT /id/<id>) or appends it to the server's route list (POST /config/…).
+// it (DELETE+POST) or appends it to the server's route list (POST /config/…).
+// Retries up to 3 times with backoff to survive the brief admin API restart
+// window that follows an in-place Caddy config reload.
 func (c *adminClient) upsertRoute(ctx context.Context, serverName string, r caddyRoute) error {
-	exists, err := c.routeExists(ctx, r.ID)
-	if err != nil {
-		return err
-	}
-
 	body, err := json.Marshal(r)
 	if err != nil {
 		return fmt.Errorf("marshal route: %w", err)
 	}
 
-	if exists {
-		// PUT /id/<id> fails when the body carries @id: Caddy momentarily indexes
-		// both the old and new entries before removing the old one, triggering a
-		// duplicate-@id validation error. Delete then re-post instead.
-		if err := c.do(ctx, http.MethodDelete, "/id/"+r.ID, nil); err != nil {
-			return fmt.Errorf("delete before update: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			}
 		}
+
+		exists, err := c.routeExists(ctx, r.ID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if exists {
+			// PUT /id/<id> fails when the body carries @id: Caddy momentarily indexes
+			// both the old and new entries before removing the old one, triggering a
+			// duplicate-@id validation error. Delete then re-post instead.
+			if err := c.do(ctx, http.MethodDelete, "/id/"+r.ID, nil); err != nil {
+				lastErr = fmt.Errorf("delete before update: %w", err)
+				continue
+			}
+		}
+
+		err = c.do(ctx, http.MethodPost,
+			fmt.Sprintf("/config/apps/http/servers/%s/routes/", serverName),
+			body,
+		)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
 	}
-	return c.do(ctx, http.MethodPost,
-		fmt.Sprintf("/config/apps/http/servers/%s/routes/", serverName),
-		body,
-	)
+	return lastErr
 }
 
 // deleteRoute removes a route by its @id. Returns nil if the route doesn't exist.
