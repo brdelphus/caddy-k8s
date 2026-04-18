@@ -42,11 +42,12 @@ func newAccessLogManager(serverName, httpServerName, adminAPI string, logger *za
 func (m *accessLogManager) Enable(ctx context.Context) error {
 	adm := newAdminClient(m.adminAPI)
 
-	// Register a named "access" logger that captures HTTP access log entries.
+	// Register a named "access" logger. No "include" filter — entries reach it
+	// only via the per-server default_logger_name set below, so each request
+	// is logged exactly once regardless of how many servers are configured.
 	loggerPayload := map[string]interface{}{
 		"writer":  map[string]interface{}{"output": "stderr"},
 		"encoder": map[string]interface{}{"format": "json"},
-		"include": []string{"http.log.access"},
 	}
 	body, err := json.Marshal(loggerPayload)
 	if err != nil {
