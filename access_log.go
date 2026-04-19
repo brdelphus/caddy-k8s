@@ -63,19 +63,6 @@ func (m *accessLogManager) Enable(ctx context.Context) error {
 		return fmt.Errorf("configure access logger: %w", err)
 	}
 
-	// Tell the default global logger to skip http.log.access entries so they
-	// are not written a second time by the catch-all default logger.
-	defaultExclPayload := map[string]interface{}{
-		"exclude": []string{"http.log.access"},
-	}
-	body, err = json.Marshal(defaultExclPayload)
-	if err != nil {
-		return fmt.Errorf("marshal default logger exclude: %w", err)
-	}
-	if err := adm.putOrPatch(ctx, "/config/logging/logs/default", body); err != nil {
-		return fmt.Errorf("configure default logger exclude: %w", err)
-	}
-
 	// Point both HTTP and HTTPS servers at the "access" logger.
 	// Initialize skip_hosts as an empty array so rebuild() can always use
 	// PATCH (update) rather than PUT (create), avoiding 409 on the second call.

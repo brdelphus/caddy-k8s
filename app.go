@@ -113,6 +113,45 @@ func (a *App) syncLog(msg string, fields ...zap.Field) {
 	}
 }
 
+// configureDefaultLogger sets excludes on Caddy's default logger and, when
+// not in verbose mode, creates a named admin.api logger at WARN level so
+// per-request INFO entries are dropped while errors still surface.
+func (a *App) configureDefaultLogger(ctx context.Context) {
+	adm := newAdminClient(a.AdminAPI)
+
+	// Build the exclude list for the default logger.
+	var excludes []string
+	if a.AccessLog {
+		// Prevent access log entries from being double-written by the default logger.
+		excludes = append(excludes, "http.log.access")
+	}
+	if !a.VerboseLogs {
+		// admin.api entries will be handled by the named admin.api logger below.
+		excludes = append(excludes, "admin.api")
+	}
+	if len(excludes) > 0 {
+		body, _ := json.Marshal(map[string]interface{}{"exclude": excludes})
+		if err := adm.putOrPatch(ctx, "/config/logging/logs/default", body); err != nil {
+			a.logger.Warn("k8s_ingress: could not configure default logger", zap.Error(err))
+		}
+	}
+
+	if !a.VerboseLogs {
+		// Named admin.api logger at WARN level — drops INFO "received request"
+		// noise while keeping errors and warnings visible. A writer is required
+		// for the level filter to take effect.
+		body, _ := json.Marshal(map[string]interface{}{
+			"writer":  map[string]interface{}{"output": "stderr"},
+			"encoder": map[string]interface{}{"format": "json"},
+			"level":   "WARN",
+			"include": []string{"admin.api"},
+		})
+		if err := adm.putOrPatch(ctx, "/config/logging/logs/admin.api", body); err != nil {
+			a.logger.Warn("k8s_ingress: could not suppress admin.api logs", zap.Error(err))
+		}
+	}
+}
+
 // CaddyModule returns the Caddy module info.
 func (*App) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -305,17 +344,9 @@ func (a *App) run(client kubernetes.Interface) {
 		}
 	}
 
-	// Suppress admin API request logs (INFO "received request") when not in
-	// verbose mode. Sets the admin.api named logger to WARN so errors still
-	// surface while the per-request noise disappears.
-	if !a.VerboseLogs {
-		adm := newAdminClient(a.AdminAPI)
-		payload := map[string]interface{}{"level": "WARN"}
-		body, _ := json.Marshal(payload)
-		if err := adm.putOrPatch(context.Background(), "/config/logging/logs/admin.api", body); err != nil {
-			a.logger.Warn("k8s_ingress: could not suppress admin.api logs", zap.Error(err))
-		}
-	}
+	// Configure default logger excludes and optional admin.api suppression.
+	// This runs after Enable() so we can combine all excludes in one PATCH.
+	a.configureDefaultLogger(context.Background())
 
 	a.logger.Info("k8s_ingress: watching ingresses",
 		zap.String("class", a.IngressClass),
